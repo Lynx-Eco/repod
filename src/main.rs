@@ -17,6 +17,7 @@ use parking_lot::Mutex;
 use rayon::prelude::*;
 use memmap2::Mmap;
 use infer;
+use dirs;
 use indicatif::{ ProgressBar, ProgressStyle, MultiProgress, ParallelProgressIterator };
 
 const LARGE_FILE_THRESHOLD: u64 = 1024 * 1024; // 1MB
@@ -116,21 +117,18 @@ const EXCLUDED_PATTERNS: &[&str] = &[
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Path to CSV file containing git repository URLs
-    #[arg(short, long)]
-    csv_file: Option<String>,
-
-    /// Single git repository URL
-    #[arg(short, long)]
-    url: Option<String>,
+    /// Git repository URL or path to CSV file containing repository URLs
+    #[arg(index = 1)]
+    input: String,
 
     /// Output directory path
     #[arg(short, long, default_value = "output")]
     output_dir: String,
 
-    /// Repository type to filter files (e.g., rs, py, js)
-    #[arg(short = 't', long, value_parser = parse_repo_type)]
-    repo_type: Option<RepoType>,
+    /// Repository types to filter files (e.g., rs, py, js, ts)
+    /// Can specify multiple times for multiple types
+    #[arg(short = 't', long, value_parser = parse_repo_type, value_delimiter = ',')]
+    repo_types: Vec<RepoType>,
 
     /// GitHub personal access token for private repositories
     #[arg(short = 'p', long)]
@@ -143,14 +141,21 @@ struct Args {
     /// SSH key passphrase (if not provided, will prompt if needed)
     #[arg(long)]
     ssh_passphrase: Option<String>,
+
+    /// Open in cursor after cloning
+    #[arg(long)]
+    open_cursor: bool,
+
+    /// Specific path to clone the repository to
+    #[arg(long)]
+    at: Option<String>,
 }
 
 #[derive(Debug, Clone)]
 enum RepoType {
     Rust,
     Python,
-    JavaScript,
-    TypeScript,
+    JavaScript, // Now includes both JS and TS
     Go,
     Java,
 }
@@ -159,8 +164,7 @@ fn parse_repo_type(s: &str) -> Result<RepoType, String> {
     match s.to_lowercase().as_str() {
         "rs" | "rust" => Ok(RepoType::Rust),
         "py" | "python" => Ok(RepoType::Python),
-        "js" | "javascript" => Ok(RepoType::JavaScript),
-        "ts" | "typescript" => Ok(RepoType::TypeScript),
+        "js" | "javascript" | "ts" | "typescript" => Ok(RepoType::JavaScript),
         "go" | "golang" => Ok(RepoType::Go),
         "java" => Ok(RepoType::Java),
         _ => Err(format!("Unknown repository type: {}", s)),
@@ -172,8 +176,8 @@ fn get_repo_type_extensions(repo_type: &RepoType) -> &'static [&'static str] {
         RepoType::Rust => &["rs", "toml"],
         RepoType::Python =>
             &["py", "pyi", "pyx", "pxd", "requirements.txt", "setup.py", "pyproject.toml"],
-        RepoType::JavaScript => &["js", "jsx", "json", "package.json"],
-        RepoType::TypeScript => &["ts", "tsx", "json", "package.json"],
+        RepoType::JavaScript =>
+            &["js", "jsx", "ts", "tsx", "json", "package.json", "tsconfig.json", "jsconfig.json"],
         RepoType::Go => &["go", "mod", "sum"],
         RepoType::Java => &["java", "gradle", "maven", "pom.xml", "build.gradle"],
     }
@@ -197,9 +201,21 @@ struct FileContent {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    if args.csv_file.is_none() && args.url.is_none() {
-        anyhow::bail!("Either --csv-file or --url must be provided");
-    }
+    // Detect if input is a CSV file or URL
+    let urls = if args.input.ends_with(".csv") {
+        // Check if file exists
+        if !Path::new(&args.input).exists() {
+            anyhow::bail!("CSV file not found: {}", args.input);
+        }
+        read_urls_from_csv(&args.input)?
+    } else if args.input.starts_with("https://") || args.input.starts_with("git@") {
+        vec![args.input.clone()]
+    } else {
+        anyhow::bail!(
+            "Input must be either a CSV file or a git URL (https:// or git@). Got: {}",
+            args.input
+        );
+    };
 
     // Check for GitHub token in environment if not provided as argument
     let args = if args.github_token.is_none() {
@@ -215,12 +231,6 @@ fn main() -> Result<()> {
 
     // Create output directory if it doesn't exist
     fs::create_dir_all(&args.output_dir)?;
-
-    let urls = if let Some(csv_path) = &args.csv_file {
-        read_urls_from_csv(csv_path)?
-    } else {
-        vec![args.url.as_ref().unwrap().clone()]
-    };
 
     // Process repositories in parallel if there are multiple
     if urls.len() > 1 {
@@ -518,8 +528,31 @@ fn process_repository(
     multi_progress: Arc<MultiProgress>
 ) -> Result<()> {
     let clone_start = Instant::now();
-    let temp_dir = TempDir::new()?;
-    let _repo = clone_repository(url, temp_dir.path(), args, &multi_progress).with_context(||
+
+    // Determine the clone directory
+    let repo_dir = if let Some(path) = &args.at {
+        PathBuf::from(path)
+    } else if args.open_cursor {
+        // Use cache directory for cursor mode if no specific path provided
+        let cache_dir = dirs
+            ::cache_dir()
+            .ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?
+            .join("repod");
+        fs::create_dir_all(&cache_dir)?;
+        cache_dir.join(extract_repo_name(url))
+    } else {
+        TempDir::new()?.into_path()
+    };
+
+    // If directory exists and is not empty, remove it first
+    if repo_dir.exists() {
+        if repo_dir.read_dir()?.next().is_some() {
+            println!("Directory exists and is not empty, removing: {}", repo_dir.display());
+            fs::remove_dir_all(&repo_dir)?;
+        }
+    }
+
+    let _repo = clone_repository(url, &repo_dir, args, &multi_progress).with_context(||
         format!("Failed to access repository: {}", url)
     )?;
 
@@ -531,9 +564,17 @@ fn process_repository(
 
     let process_start = Instant::now();
 
-    let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-    let repo_name = extract_repo_name(url);
-    let output_file_name = format!("{}/{}_{}.txt", output_dir, repo_name, timestamp);
+    // Determine output file location
+    let output_file_name = if args.open_cursor {
+        // In cursor mode, write to the repo root
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+        repo_dir.join(format!("screenpipe_{}.txt", timestamp))
+    } else {
+        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+        let repo_name = extract_repo_name(url);
+        PathBuf::from(format!("{}/{}_{}.txt", output_dir, repo_name, timestamp))
+    };
+
     let mut output_file = File::create(&output_file_name)?;
 
     // Create tokenizer once
@@ -546,9 +587,8 @@ fn process_repository(
     scan_pb.set_message("Scanning repository structure...");
 
     let mut readme_content: Option<FileContent> = None;
-    let root_path = temp_dir.path();
     for readme_name in ["README.md", "README.txt", "README", "Readme.md", "readme.md"] {
-        let readme_path = root_path.join(readme_name);
+        let readme_path = repo_dir.join(readme_name);
         if readme_path.exists() && readme_path.is_file() {
             if let Ok(content) = read_file_content(&readme_path) {
                 let tokens = tokenizer.encode_with_special_tokens(&content);
@@ -566,7 +606,7 @@ fn process_repository(
     }
 
     // Count total files first for progress bar
-    let total_files = WalkDir::new(temp_dir.path())
+    let total_files = WalkDir::new(&repo_dir)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
@@ -585,7 +625,7 @@ fn process_repository(
     process_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Collect and process other files in parallel
-    let files: Vec<_> = WalkDir::new(temp_dir.path())
+    let files: Vec<_> = WalkDir::new(&repo_dir)
         .into_iter()
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
@@ -601,7 +641,11 @@ fn process_repository(
             }
 
             if
-                !should_process_file(path, args.repo_type.as_ref()) ||
+                !should_process_file(path, if args.repo_types.is_empty() {
+                    None
+                } else {
+                    Some(&args.repo_types)
+                }) ||
                 matches!(is_binary_file(path), Ok(true))
             {
                 return None;
@@ -610,11 +654,7 @@ fn process_repository(
             read_file_content(path)
                 .ok()
                 .map(|content| {
-                    let relative_path = path
-                        .strip_prefix(temp_dir.path())
-                        .unwrap()
-                        .display()
-                        .to_string();
+                    let relative_path = path.strip_prefix(&repo_dir).unwrap().display().to_string();
                     let tokens = tokenizer.encode_with_special_tokens(&content);
                     FileContent {
                         path: relative_path,
@@ -670,10 +710,18 @@ fn process_repository(
     drop(write_pb);
     multi_progress.clear()?;
 
+    // If cursor mode is enabled, run the cursor command
+    if args.open_cursor {
+        let cursor_cmd = format!("cursor {}", repo_dir.display());
+        if let Err(e) = std::process::Command::new("sh").arg("-c").arg(&cursor_cmd).spawn() {
+            println!("Failed to open Cursor: {}", e);
+        }
+    }
+
     Ok(())
 }
 
-fn is_text_file(path: &Path, repo_type: Option<&RepoType>) -> Result<bool> {
+fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
     // First check the path against excluded patterns
     let path_str = path.to_string_lossy();
     if EXCLUDED_PATTERNS.iter().any(|pattern| path_str.contains(pattern)) {
@@ -686,16 +734,22 @@ fn is_text_file(path: &Path, repo_type: Option<&RepoType>) -> Result<bool> {
         return Ok(true);
     }
 
-    // If repo_type is specified, only allow files with matching extensions
-    if let Some(repo_type) = repo_type {
+    // If repo_types is specified, check if file matches any of the types
+    if let Some(repo_types) = repo_types {
         if let Some(ext) = path.extension() {
             let ext_str = ext.to_string_lossy().to_lowercase();
-            return Ok(get_repo_type_extensions(repo_type).contains(&ext_str.as_str()));
+            return Ok(
+                repo_types
+                    .iter()
+                    .any(|repo_type| {
+                        get_repo_type_extensions(repo_type).contains(&ext_str.as_str())
+                    })
+            );
         }
         return Ok(false);
     }
 
-    // If no repo_type specified, use the original text file detection logic
+    // If no repo_types specified, use the original text file detection logic
     // Check if it's a known text extension
     if let Some(ext) = path.extension() {
         let ext_str = ext.to_string_lossy().to_lowercase();
@@ -749,8 +803,8 @@ fn is_text_file(path: &Path, repo_type: Option<&RepoType>) -> Result<bool> {
     Ok(ratio <= TEXT_THRESHOLD)
 }
 
-fn should_process_file(path: &Path, repo_type: Option<&RepoType>) -> bool {
-    match is_text_file(path, repo_type) {
+fn should_process_file(path: &Path, repo_types: Option<&[RepoType]>) -> bool {
+    match is_text_file(path, repo_types) {
         Ok(is_text) => is_text,
         Err(_) => false,
     }
