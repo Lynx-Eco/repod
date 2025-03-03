@@ -21,3 +21,4 @@ parking_lot = "0.12.1"
 rpassword = "7.3.1"
 indicatif = { version = "0.17.8", features = ["rayon"] }
 dirs = "6.0.0"
+copypasta = "0.10.0"

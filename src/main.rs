@@ -18,7 +18,11 @@ use rayon::prelude::*;
 use memmap2::Mmap;
 use infer;
 use dirs;
+use copypasta::{ ClipboardContext, ClipboardProvider };
 use indicatif::{ ProgressBar, ProgressStyle, MultiProgress, ParallelProgressIterator };
+
+mod tree;
+use tree::DirectoryTree;
 
 const LARGE_FILE_THRESHOLD: u64 = 1024 * 1024; // 1MB
 const CHUNK_SIZE: usize = 100;
@@ -112,14 +116,29 @@ const EXCLUDED_PATTERNS: &[&str] = &[
     "package-lock.json",
     "yarn.lock",
     "Cargo.lock",
+    "venv/",
+    ".venv/",
+    "env/",
+    "__pycache__/",
+    ".pytest_cache/",
+    ".svn/",
+    ".hg/",
+    ".DS_Store",
+    ".idea/",
+    ".vs/",
+    ".vscode/",
+    ".gradle/",
+    "out/",
+    "coverage/",
+    "tmp/",
 ];
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Git repository URL or path to CSV file containing repository URLs
+    /// Git repository URL, path to CSV file, or nothing to use current directory
     #[arg(index = 1)]
-    input: String,
+    input: Option<String>,
 
     /// Output directory path
     #[arg(short, long, default_value = "output")]
@@ -149,6 +168,10 @@ struct Args {
     /// Specific path to clone the repository to
     #[arg(long)]
     at: Option<String>,
+
+    /// Copy output to clipboard instead of saving to file
+    #[arg(long)]
+    copy: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -201,20 +224,25 @@ struct FileContent {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    // Detect if input is a CSV file or URL
-    let urls = if args.input.ends_with(".csv") {
-        // Check if file exists
-        if !Path::new(&args.input).exists() {
-            anyhow::bail!("CSV file not found: {}", args.input);
+    // Get URLs or use current directory
+    let urls = if let Some(input) = &args.input {
+        if input.ends_with(".csv") {
+            // Check if file exists
+            if !Path::new(input).exists() {
+                anyhow::bail!("CSV file not found: {}", input);
+            }
+            read_urls_from_csv(input)?
+        } else if input.starts_with("https://") || input.starts_with("git@") {
+            vec![input.clone()]
+        } else {
+            anyhow::bail!(
+                "Input must be either a CSV file or a git URL (https:// or git@). Got: {}",
+                input
+            );
         }
-        read_urls_from_csv(&args.input)?
-    } else if args.input.starts_with("https://") || args.input.starts_with("git@") {
-        vec![args.input.clone()]
     } else {
-        anyhow::bail!(
-            "Input must be either a CSV file or a git URL (https:// or git@). Got: {}",
-            args.input
-        );
+        // Use current directory
+        vec![".".to_string()]
     };
 
     // Check for GitHub token in environment if not provided as argument
@@ -229,8 +257,10 @@ fn main() -> Result<()> {
     let stats = Arc::new(Mutex::new(ProcessingStats::default()));
     let multi_progress = Arc::new(MultiProgress::new());
 
-    // Create output directory if it doesn't exist
-    fs::create_dir_all(&args.output_dir)?;
+    // Only create output directory if we're not copying to clipboard
+    if !args.copy {
+        fs::create_dir_all(&args.output_dir)?;
+    }
 
     // Process repositories in parallel if there are multiple
     if urls.len() > 1 {
@@ -294,7 +324,7 @@ fn read_file_content(path: &Path) -> Result<String> {
     }
 }
 
-fn process_files_batch(files: &[FileContent], output: &mut File) -> Result<()> {
+fn process_files_batch(files: &[FileContent], output: &mut dyn Write) -> Result<()> {
     for file in files {
         // Write file info and content
         writeln!(output, "<file_info>")?;
@@ -529,8 +559,11 @@ fn process_repository(
 ) -> Result<()> {
     let clone_start = Instant::now();
 
-    // Determine the clone directory
-    let repo_dir = if let Some(path) = &args.at {
+    // Determine the repository directory
+    let repo_dir = if url == "." {
+        // Use current directory
+        std::env::current_dir()?
+    } else if let Some(path) = &args.at {
         PathBuf::from(path)
     } else if args.open_cursor {
         // Use cache directory for cursor mode if no specific path provided
@@ -544,38 +577,28 @@ fn process_repository(
         TempDir::new()?.into_path()
     };
 
-    // If directory exists and is not empty, remove it first
-    if repo_dir.exists() {
-        if repo_dir.read_dir()?.next().is_some() {
-            println!("Directory exists and is not empty, removing: {}", repo_dir.display());
-            fs::remove_dir_all(&repo_dir)?;
+    // Only clone if it's a remote repository
+    if url != "." {
+        // If directory exists and is not empty, remove it first
+        if repo_dir.exists() {
+            if repo_dir.read_dir()?.next().is_some() {
+                println!("Directory exists and is not empty, removing: {}", repo_dir.display());
+                fs::remove_dir_all(&repo_dir)?;
+            }
+        }
+
+        let _repo = clone_repository(url, &repo_dir, args, &multi_progress).with_context(||
+            format!("Failed to access repository: {}", url)
+        )?;
+
+        {
+            let mut stats_guard = stats.lock();
+            stats_guard.repo_count += 1;
+            stats_guard.clone_time += clone_start.elapsed().as_secs_f64();
         }
     }
 
-    let _repo = clone_repository(url, &repo_dir, args, &multi_progress).with_context(||
-        format!("Failed to access repository: {}", url)
-    )?;
-
-    {
-        let mut stats_guard = stats.lock();
-        stats_guard.repo_count += 1;
-        stats_guard.clone_time += clone_start.elapsed().as_secs_f64();
-    }
-
     let process_start = Instant::now();
-
-    // Determine output file location
-    let output_file_name = if args.open_cursor {
-        // In cursor mode, write to the repo root
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        repo_dir.join(format!("screenpipe_{}.txt", timestamp))
-    } else {
-        let timestamp = Local::now().format("%Y%m%d_%H%M%S");
-        let repo_name = extract_repo_name(url);
-        PathBuf::from(format!("{}/{}_{}.txt", output_dir, repo_name, timestamp))
-    };
-
-    let mut output_file = File::create(&output_file_name)?;
 
     // Create tokenizer once
     let tokenizer = Arc::new(o200k_base().unwrap());
@@ -690,19 +713,58 @@ fn process_repository(
         ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap()
     );
     write_pb.enable_steady_tick(std::time::Duration::from_millis(100));
-    write_pb.set_message("Writing output file...");
+    write_pb.set_message("Writing output");
+
+    // Create output content
+    let mut output_buffer = Vec::new();
+
+    // First, write the directory tree
+    writeln!(&mut output_buffer, "<directory_structure>")?;
+    let tree = DirectoryTree::build(&repo_dir, EXCLUDED_PATTERNS)?;
+    writeln!(&mut output_buffer, "{}", tree.format())?;
+    writeln!(&mut output_buffer, "</directory_structure>\n")?;
 
     // Write README first if it exists
     if let Some(readme) = readme_content {
-        process_files_batch(&[readme], &mut output_file)?;
+        process_files_batch(&[readme], &mut output_buffer)?;
     }
 
     // Write remaining files in chunks
     for chunk in files.chunks(CHUNK_SIZE) {
-        process_files_batch(chunk, &mut output_file)?;
+        process_files_batch(chunk, &mut output_buffer)?;
     }
 
-    write_pb.finish_with_message("Finished writing output file");
+    // Handle output based on mode
+    if args.copy {
+        // Copy to clipboard
+        let content = String::from_utf8(output_buffer)?;
+        let mut ctx = ClipboardContext::new().map_err(|e|
+            anyhow::anyhow!("Failed to access clipboard: {}", e)
+        )?;
+        ctx
+            .set_contents(content)
+            .map_err(|e| anyhow::anyhow!("Failed to copy to clipboard: {}", e))?;
+        println!("Content copied to clipboard");
+    } else {
+        // Write to file
+        let output_file_name = if args.open_cursor {
+            // In cursor mode, write to the repo root
+            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+            repo_dir.join(format!("screenpipe_{}.txt", timestamp))
+        } else {
+            let timestamp = Local::now().format("%Y%m%d_%H%M%S");
+            let repo_name = if url == "." {
+                repo_dir.file_name().unwrap().to_string_lossy().to_string()
+            } else {
+                extract_repo_name(url)
+            };
+            PathBuf::from(format!("{}/{}_{}.txt", output_dir, repo_name, timestamp))
+        };
+        let mut file = File::create(&output_file_name)?;
+        file.write_all(&output_buffer)?;
+    }
+
+    write_pb.finish_with_message("Finished writing output");
 
     // Make sure all progress bars are properly cleaned up
     drop(scan_pb);
