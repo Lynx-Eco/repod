@@ -172,6 +172,11 @@ struct Args {
     /// Copy output to clipboard instead of saving to file
     #[arg(long)]
     copy: bool,
+
+    /// Additional folder or path patterns to exclude from processing
+    /// Can be specified multiple times or as a comma‑separated list
+    #[arg(short = 'e', long = "exclude", value_delimiter = ',')]
+    exclude: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -213,6 +218,7 @@ struct ProcessingStats {
     clone_time: f64,
     processing_time: f64,
     repo_count: usize,
+    binary_files_skipped: usize,
 }
 
 struct FileContent {
@@ -318,9 +324,11 @@ fn read_file_content(path: &Path) -> Result<String> {
         Ok(String::from_utf8_lossy(&mmap).into_owned())
     } else {
         // Use regular reading for small files
-        let mut content = String::with_capacity(metadata.len() as usize);
-        BufReader::new(file).read_to_string(&mut content)?;
-        Ok(content)
+        // Read raw bytes first to handle potential non-UTF8 sequences
+        let mut buffer = Vec::with_capacity(metadata.len() as usize);
+        BufReader::new(file).read_to_end(&mut buffer)?;
+        // Convert to string lossily, replacing invalid sequences
+        Ok(String::from_utf8_lossy(&buffer).into_owned())
     }
 }
 
@@ -628,9 +636,19 @@ fn process_repository(
         }
     }
 
+    // Build combined list of excluded patterns (built‑in + user‑supplied)
+    let excluded_patterns: Vec<&str> = EXCLUDED_PATTERNS.iter()
+        .copied()
+        .chain(args.exclude.iter().map(|s| s.as_str()))
+        .collect();
+
     // Count total files first for progress bar
     let total_files = WalkDir::new(&repo_dir)
         .into_iter()
+        .filter_entry(|e| {
+            let path_str = e.path().to_string_lossy();
+            !excluded_patterns.iter().any(|pattern| path_str.contains(pattern))
+        })
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .count();
@@ -650,6 +668,10 @@ fn process_repository(
     // Collect and process other files in parallel
     let files: Vec<_> = WalkDir::new(&repo_dir)
         .into_iter()
+        .filter_entry(|e| {
+            let path_str = e.path().to_string_lossy();
+            !excluded_patterns.iter().any(|pattern| path_str.contains(pattern))
+        })
         .filter_map(Result::ok)
         .filter(|e| e.file_type().is_file())
         .par_bridge()
@@ -663,14 +685,18 @@ fn process_repository(
                 }
             }
 
-            if
-                !should_process_file(path, if args.repo_types.is_empty() {
-                    None
-                } else {
-                    Some(&args.repo_types)
-                }) ||
-                matches!(is_binary_file(path), Ok(true))
-            {
+            let should_process = should_process_file(path, if args.repo_types.is_empty() {
+                None
+            } else {
+                Some(&args.repo_types)
+            });
+            let is_binary = matches!(is_binary_file(path), Ok(true));
+
+            if !should_process || is_binary {
+                if is_binary {
+                    // Increment binary skipped counter if is_binary is true
+                    stats.lock().binary_files_skipped += 1;
+                }
                 return None;
             }
 
@@ -720,7 +746,7 @@ fn process_repository(
 
     // First, write the directory tree
     writeln!(&mut output_buffer, "<directory_structure>")?;
-    let tree = DirectoryTree::build(&repo_dir, EXCLUDED_PATTERNS)?;
+    let tree = DirectoryTree::build(&repo_dir, &excluded_patterns)?;
     writeln!(&mut output_buffer, "{}", tree.format())?;
     writeln!(&mut output_buffer, "</directory_structure>\n")?;
 
@@ -896,6 +922,7 @@ fn print_stats(stats: &ProcessingStats) {
     println!("\nProcessing Statistics:");
     println!("Total repositories processed: {}", stats.repo_count);
     println!("Total files processed: {}", stats.total_files);
+    println!("Total binary files skipped: {}", stats.binary_files_skipped);
     println!("Total tokens: {}", stats.total_tokens);
     println!("Repository clone time: {:.2} seconds", stats.clone_time);
     println!("Content processing time: {:.2} seconds", stats.processing_time);
