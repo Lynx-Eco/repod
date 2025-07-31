@@ -6,6 +6,7 @@ use std::{
     sync::Arc,
     path::PathBuf,
 };
+use glob::Pattern;
 use anyhow::{ Context, Result };
 use clap::Parser;
 use git2::Repository;
@@ -177,6 +178,11 @@ struct Args {
     /// Can be specified multiple times or as a comma‑separated list
     #[arg(short = 'e', long = "exclude", value_delimiter = ',')]
     exclude: Vec<String>,
+
+    /// Only include files matching these patterns (e.g., *.mdx, *.tsx)
+    /// Can be specified multiple times or as a comma-separated list
+    #[arg(long = "only", value_delimiter = ',')]
+    only: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -621,6 +627,21 @@ fn process_repository(
     for readme_name in ["README.md", "README.txt", "README", "Readme.md", "readme.md"] {
         let readme_path = repo_dir.join(readme_name);
         if readme_path.exists() && readme_path.is_file() {
+            // Check if README matches the only patterns
+            if !args.only.is_empty() {
+                let matches_pattern = args.only.iter().any(|pattern| {
+                    if let Ok(glob_pattern) = Pattern::new(pattern) {
+                        glob_pattern.matches(readme_name)
+                    } else {
+                        false
+                    }
+                });
+                
+                if !matches_pattern {
+                    continue; // Skip this README if it doesn't match
+                }
+            }
+            
             if let Ok(content) = read_file_content(&readme_path) {
                 let tokens = tokenizer.encode_with_special_tokens(&content);
                 readme_content = Some(FileContent {
@@ -689,7 +710,7 @@ fn process_repository(
                 None
             } else {
                 Some(&args.repo_types)
-            });
+            }, &args.only);
             let is_binary = matches!(is_binary_file(path), Ok(true));
 
             if !should_process || is_binary {
@@ -746,7 +767,7 @@ fn process_repository(
 
     // First, write the directory tree
     writeln!(&mut output_buffer, "<directory_structure>")?;
-    let tree = DirectoryTree::build(&repo_dir, &excluded_patterns)?;
+    let tree = DirectoryTree::build(&repo_dir, &excluded_patterns, &args.only)?;
     writeln!(&mut output_buffer, "{}", tree.format())?;
     writeln!(&mut output_buffer, "</directory_structure>\n")?;
 
@@ -891,7 +912,27 @@ fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
     Ok(ratio <= TEXT_THRESHOLD)
 }
 
-fn should_process_file(path: &Path, repo_types: Option<&[RepoType]>) -> bool {
+fn should_process_file(path: &Path, repo_types: Option<&[RepoType]>, only_patterns: &[String]) -> bool {
+    // If --only patterns are specified, check against them first
+    if !only_patterns.is_empty() {
+        let path_str = path.to_string_lossy();
+        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+        
+        // Check if any pattern matches the full path or just the filename
+        let matches_pattern = only_patterns.iter().any(|pattern| {
+            if let Ok(glob_pattern) = Pattern::new(pattern) {
+                glob_pattern.matches(&path_str) || glob_pattern.matches(file_name)
+            } else {
+                false
+            }
+        });
+        
+        if !matches_pattern {
+            return false;
+        }
+    }
+    
+    // If --only patterns match or are not specified, continue with regular filtering
     match is_text_file(path, repo_types) {
         Ok(is_text) => is_text,
         Err(_) => false,

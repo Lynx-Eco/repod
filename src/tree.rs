@@ -2,6 +2,7 @@ use std::path::Path;
 use walkdir::WalkDir;
 use anyhow::Result;
 use std::collections::HashMap;
+use glob::Pattern;
 
 pub struct DirectoryTree {
     name: String,
@@ -10,7 +11,7 @@ pub struct DirectoryTree {
 }
 
 impl DirectoryTree {
-    pub fn build(path: &Path, excluded_patterns: &[&str]) -> Result<DirectoryTree> {
+    pub fn build(path: &Path, excluded_patterns: &[&str], only_patterns: &[String]) -> Result<DirectoryTree> {
         let root_name = path
             .file_name()
             .unwrap_or_else(|| path.as_os_str())
@@ -31,19 +32,40 @@ impl DirectoryTree {
             .min_depth(1)
             .into_iter()
             .filter_entry(|e| {
+                // Check excluded patterns
+                let path_str = e.path().to_string_lossy();
                 !excluded_patterns
                     .iter()
-                    .any(|pattern| e.path().to_string_lossy().contains(pattern))
+                    .any(|pattern| path_str.contains(pattern))
             })
             .filter_map(Result::ok) {
-            let path_str = entry.path().to_string_lossy().to_string();
-            let parent_str = entry.path().parent().unwrap().to_string_lossy().to_string();
+            let entry_path = entry.path();
+            let parent_str = entry_path.parent().unwrap().to_string_lossy().to_string();
             let name = entry.file_name().to_string_lossy().to_string();
+            let is_file = entry.file_type().is_file();
+
+            // For files, check if they match the only patterns
+            if is_file && !only_patterns.is_empty() {
+                let path_str = entry_path.to_string_lossy();
+                let file_name = entry_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                
+                let matches_pattern = only_patterns.iter().any(|pattern| {
+                    if let Ok(glob_pattern) = Pattern::new(pattern) {
+                        glob_pattern.matches(&path_str) || glob_pattern.matches(file_name)
+                    } else {
+                        false
+                    }
+                });
+                
+                if !matches_pattern {
+                    continue;
+                }
+            }
 
             let node = DirectoryTree {
                 name,
                 children: Vec::new(),
-                is_file: entry.file_type().is_file(),
+                is_file,
             };
 
             path_map.entry(parent_str).or_default().push(node);
@@ -51,6 +73,12 @@ impl DirectoryTree {
 
         // Build the tree recursively starting from root
         root.build_recursive(path, &mut path_map);
+        
+        // Prune empty directories if only patterns are specified
+        if !only_patterns.is_empty() {
+            root.prune_empty_directories();
+        }
+        
         root.sort_children();
 
         Ok(root)
@@ -72,6 +100,18 @@ impl DirectoryTree {
                 self.children.push(child);
             }
         }
+    }
+
+    fn prune_empty_directories(&mut self) -> bool {
+        if self.is_file {
+            return true; // Files are always kept
+        }
+
+        // Recursively prune children and keep only non-empty ones
+        self.children.retain_mut(|child| child.prune_empty_directories());
+        
+        // A directory is kept if it has any children (files or non-empty directories)
+        !self.children.is_empty()
     }
 
     fn sort_children(&mut self) {

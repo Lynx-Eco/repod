@@ -57,6 +57,9 @@ repod -t rust,python,javascript
 # Exclude specific directories or patterns
 repod -e node_modules,target,build
 
+# Only include files matching specific patterns
+repod --only "*.mdx,*.tsx"
+
 # Copy output to clipboard instead of saving to file
 repod --copy
 
@@ -91,6 +94,7 @@ Options:
   -t, --repo-types <REPO_TYPES>  Repository types to filter files (e.g., rs, py, js, ts)
   -p, --github-token <GITHUB_TOKEN>  GitHub personal access token for private repositories
   -e, --exclude <EXCLUDE>        Additional folder or path patterns to exclude from processing
+      --only <ONLY>              Only include files matching these patterns (e.g., *.mdx, *.tsx)
       --ssh-key <SSH_KEY>        SSH key path (defaults to ~/.ssh/id_rsa)
       --ssh-passphrase <SSH_PASSPHRASE>  SSH key passphrase (if not provided, will prompt if needed)
       --open-cursor              Open in Cursor after cloning
@@ -125,4 +129,14 @@ repod -t rust,go -e tests,examples,target
 
 ```bash
 repod . --copy
+```
+
+### Process Only Specific File Types
+
+```bash
+# Only include MDX and TSX files
+repod --only "*.mdx,*.tsx"
+
+# Only include files in specific directories matching a pattern
+repod --only "src/**/*.rs,tests/**/*.rs"
 ``` 
