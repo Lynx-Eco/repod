@@ -79,7 +79,14 @@ cargo run --release -- [args]          # Release mode
 
 ### Exclusion Patterns
 
-Default exclusions include common build artifacts and dependencies:
-- `.git`, `node_modules`, `target`, `dist`, `build`, `__pycache__`
-- Binary files detected by content analysis
+Default exclusions include:
+- **Automatic**: All files and directories starting with `.` (dotfiles/dotfolders)
+- **Gitignore**: Respects patterns in `.gitignore` file if present
+- **Build artifacts**: `node_modules`, `target`, `dist`, `build`, `out`, `bin`, `coverage`
+- **Python**: `__pycache__`, `.pytest_cache`, `.mypy_cache`, `.tox`, `venv`, `.venv`, `env`, `.eggs`
+- **JavaScript**: `.next`, `.nuxt`, `.parcel-cache`, `.turbo`, `.vercel`, `.output`
+- **Version control**: `.git`, `.svn`, `.hg`
+- **IDE**: `.idea`, `.vs`, `.vscode`
+- **Lock files**: `package-lock.json`, `yarn.lock`, `pnpm-lock.yaml`, `Cargo.lock`, `poetry.lock`, `Pipfile.lock`, `composer.lock`, `Gemfile.lock`, `go.sum`, `mix.lock`, `flake.lock`, `pubspec.lock`, `packages.lock.json`
+- **Binary files**: Detected by content analysis
 - Additional patterns can be specified with `-e` flag

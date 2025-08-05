@@ -23,3 +23,4 @@ indicatif = { version = "0.17.8", features = ["rayon"] }
 dirs = "6.0.0"
 copypasta = "0.10.0"
 glob = "0.3.1"
+ignore = "0.4.23"

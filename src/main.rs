@@ -11,7 +11,7 @@ use anyhow::{ Context, Result };
 use clap::Parser;
 use git2::Repository;
 use tempfile::TempDir;
-use walkdir::WalkDir;
+use ignore::{WalkBuilder, DirEntry};
 use tiktoken_rs::o200k_base;
 use chrono::Local;
 use parking_lot::Mutex;
@@ -109,19 +109,25 @@ const EXCLUDED_PATTERNS: &[&str] = &[
     "build/",
     "dist/",
     "bin/",
-    ".tiktoken",
-    ".bin",
-    ".pack",
-    ".idx",
-    ".cache",
-    "package-lock.json",
-    "yarn.lock",
-    "Cargo.lock",
-    "venv/",
-    ".venv/",
-    "env/",
     "__pycache__/",
     ".pytest_cache/",
+    ".mypy_cache/",
+    ".tox/",
+    ".venv/",
+    "venv/",
+    "env/",
+    ".env/",
+    ".next/",
+    ".nuxt/",
+    ".cache/",
+    ".parcel-cache/",
+    ".turbo/",
+    ".vercel/",
+    ".output/",
+    "coverage/",
+    ".nyc_output/",
+    ".eggs/",
+    "*.egg-info/",
     ".svn/",
     ".hg/",
     ".DS_Store",
@@ -130,8 +136,24 @@ const EXCLUDED_PATTERNS: &[&str] = &[
     ".vscode/",
     ".gradle/",
     "out/",
-    "coverage/",
     "tmp/",
+    ".tiktoken",
+    ".bin",
+    ".pack",
+    ".idx",
+    "package-lock.json",
+    "yarn.lock",
+    "pnpm-lock.yaml",
+    "Cargo.lock",
+    "poetry.lock",
+    "Pipfile.lock",
+    "composer.lock",
+    "Gemfile.lock",
+    "go.sum",
+    "mix.lock",
+    "flake.lock",
+    "pubspec.lock",
+    "packages.lock.json",
 ];
 
 #[derive(Parser, Debug)]
@@ -663,15 +685,59 @@ fn process_repository(
         .chain(args.exclude.iter().map(|s| s.as_str()))
         .collect();
 
+    // Build the walker with ignore support
+    let mut walker_builder = WalkBuilder::new(&repo_dir);
+    
+    // Configure the walker
+    // For cloned repos, we disable git-specific ignores to ensure consistent behavior
+    // regardless of how the repo was obtained (cloned vs downloaded)
+    let is_cloned_repo = url != ".";
+    
+    
+    walker_builder
+        .hidden(false) // We'll handle hidden files with our own logic
+        .git_ignore(true) // Always respect .gitignore files in the repo
+        .git_global(!is_cloned_repo) // Only respect global gitignore for local repos
+        .git_exclude(!is_cloned_repo) // Only respect .git/info/exclude for local repos
+        .ignore(true) // Respect .ignore files
+        .parents(!is_cloned_repo); // Only respect parent ignore files for local repos
+    
+    // Add custom ignore patterns
+    for pattern in &excluded_patterns {
+        walker_builder.add_custom_ignore_filename(format!(".{}", pattern));
+    }
+
     // Count total files first for progress bar
-    let total_files = WalkDir::new(&repo_dir)
-        .into_iter()
-        .filter_entry(|e| {
-            let path_str = e.path().to_string_lossy();
-            !excluded_patterns.iter().any(|pattern| path_str.contains(pattern))
-        })
+    let total_files: usize = walker_builder.build()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
+        .filter(|entry| {
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            
+            // Check our built-in exclusions
+            let is_excluded = excluded_patterns.iter().any(|pattern| path_str.contains(pattern));
+            
+            // Check if it's a hidden file/folder (starts with .)
+            // Only check path components RELATIVE to the repo_dir to avoid issues with temp directories
+            let is_hidden = if let Ok(relative_path) = path.strip_prefix(&repo_dir) {
+                relative_path.components().any(|component| {
+                    if let std::path::Component::Normal(name) = component {
+                        name.to_string_lossy().starts_with('.')
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                // If we can't get relative path, check the full path (fallback)
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with('.'))
+                    .unwrap_or(false)
+            };
+            
+            let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+            
+            is_file && !is_excluded && !is_hidden
+        })
         .count();
 
     scan_pb.finish_with_message(format!("Found {} files", total_files));
@@ -687,17 +753,37 @@ fn process_repository(
     process_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Collect and process other files in parallel
-    let files: Vec<_> = WalkDir::new(&repo_dir)
-        .into_iter()
-        .filter_entry(|e| {
-            let path_str = e.path().to_string_lossy();
-            !excluded_patterns.iter().any(|pattern| path_str.contains(pattern))
-        })
+    let files: Vec<_> = walker_builder.build()
         .filter_map(Result::ok)
-        .filter(|e| e.file_type().is_file())
+        .filter(|entry| {
+            let path = entry.path();
+            let path_str = path.to_string_lossy();
+            
+            // Check our built-in exclusions
+            let is_excluded = excluded_patterns.iter().any(|pattern| path_str.contains(pattern));
+            
+            // Check if it's a hidden file/folder (starts with .)
+            // Only check path components RELATIVE to the repo_dir to avoid issues with temp directories
+            let is_hidden = if let Ok(relative_path) = path.strip_prefix(&repo_dir) {
+                relative_path.components().any(|component| {
+                    if let std::path::Component::Normal(name) = component {
+                        name.to_string_lossy().starts_with('.')
+                    } else {
+                        false
+                    }
+                })
+            } else {
+                // If we can't get relative path, check the full path (fallback)
+                path.file_name()
+                    .map(|name| name.to_string_lossy().starts_with('.'))
+                    .unwrap_or(false)
+            };
+            
+            entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) && !is_excluded && !is_hidden
+        })
         .par_bridge()
         .progress_with(process_pb.clone())
-        .filter_map(|entry| {
+        .filter_map(|entry: DirEntry| {
             let path = entry.path();
             // Skip if this is the README we already processed
             if let Some(ref readme) = readme_content {
@@ -938,6 +1024,7 @@ fn should_process_file(path: &Path, repo_types: Option<&[RepoType]>, only_patter
         Err(_) => false,
     }
 }
+
 
 fn extract_repo_name(url: &str) -> String {
     url.split('/').last().unwrap_or("repo").trim_end_matches(".git").to_string()

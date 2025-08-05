@@ -12,6 +12,8 @@ A CLI tool that recursively processes repositories, generates directory structur
 - Copy output to clipboard or save to file
 - Detect and skip binary files
 - Process large repositories efficiently with parallel processing
+- Respects `.gitignore` files at all directory levels
+- Automatically excludes hidden files and directories (starting with `.`)
 
 ## Installation
 

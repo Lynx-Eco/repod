@@ -1,8 +1,9 @@
 use std::path::Path;
-use walkdir::WalkDir;
 use anyhow::Result;
 use std::collections::HashMap;
 use glob::Pattern;
+use ignore::WalkBuilder;
+
 
 pub struct DirectoryTree {
     name: String,
@@ -27,22 +28,49 @@ impl DirectoryTree {
         // Build a map of parent paths to their children
         let mut path_map: HashMap<String, Vec<DirectoryTree>> = HashMap::new();
 
+        // Build the walker with ignore support
+        let mut walker_builder = WalkBuilder::new(path);
+        walker_builder
+            .hidden(false) // We'll handle hidden files ourselves
+            .git_ignore(true)
+            .git_global(true)
+            .git_exclude(true)
+            .ignore(true)
+            .parents(true);
+
         // Collect all entries
-        for entry in WalkDir::new(path)
-            .min_depth(1)
-            .into_iter()
-            .filter_entry(|e| {
+        for entry in walker_builder.build()
+            .filter_map(Result::ok)
+            .filter(|entry| {
+                let entry_path = entry.path();
+                
+                // Skip the root directory itself
+                if entry_path == path {
+                    return false;
+                }
+                
+                let path_str = entry_path.to_string_lossy();
+                
                 // Check excluded patterns
-                let path_str = e.path().to_string_lossy();
-                !excluded_patterns
+                let is_excluded = excluded_patterns
                     .iter()
-                    .any(|pattern| path_str.contains(pattern))
-            })
-            .filter_map(Result::ok) {
+                    .any(|pattern| path_str.contains(pattern));
+                
+                // Check if it's a hidden file/folder (starts with .)
+                let is_hidden = entry_path.components().any(|component| {
+                    if let std::path::Component::Normal(name) = component {
+                        name.to_string_lossy().starts_with('.')
+                    } else {
+                        false
+                    }
+                });
+                
+                !is_excluded && !is_hidden
+            }) {
             let entry_path = entry.path();
             let parent_str = entry_path.parent().unwrap().to_string_lossy().to_string();
             let name = entry.file_name().to_string_lossy().to_string();
-            let is_file = entry.file_type().is_file();
+            let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
 
             // For files, check if they match the only patterns
             if is_file && !only_patterns.is_empty() {
