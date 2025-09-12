@@ -75,6 +75,11 @@ repod https://github.com/username/repo --at /path/to/clone
 
 # Open in Cursor IDE after cloning
 repod git@github.com:username/repo.git --open-cursor
+
+# Stage and commit changes with AI message (uses GEMINI_API_KEY, interactive confirm)
+# Note: --commit only works on the current directory
+repod --commit
+
 ```
 
 ## Authentication
@@ -108,6 +113,8 @@ Options:
       --at <AT>                  Specific path to clone the repository to
       --copy                     Copy output to clipboard (explicit)
       --write                    Write output to file (overrides default copy behavior)
+      --commit                   Stage and commit changes with an AI-generated message (interactive; uses GEMINI_API_KEY; current directory only)
+      
   -h, --help                     Print help
   -V, --version                  Print version
 ```
@@ -175,6 +182,26 @@ repod repos.csv --write
 Notes:
 - With CSV or multiple URLs, default is to write files to avoid clipboard overwrites.
 - You can still force clipboard behavior with `--copy` (last finisher wins in the clipboard).
+
+## AI Commit Messages
+
+When `--commit` is provided, the tool proposes a Conventional Commit message with a subject and a short body based on your current diff (against `HEAD`), shows it for review, and prompts for confirmation. If accepted, it runs `git add -A` and commits with that message. It uses Google’s Gemini model `models/gemini-2.5-flash` via the Generative Language API.
+
+Important: `--commit` only works when processing the current directory (no CSV or remote URL). For other inputs, the commit step is skipped.
+
+Environment variable:
+
+```bash
+export GEMINI_API_KEY=your_google_api_key
+```
+
+Behavior:
+- If the API key is missing or the request fails, a concise fallback message is generated locally.
+- If there are no changes to commit, the step is skipped.
+- The message uses Conventional Commits (e.g., `feat: add search filter`) and includes a brief body.
+- `--commit` is ignored for CSV or remote URLs; no commits are performed in those modes.
+
+Multi-commit planning: When `--commit` is used, the tool will also ask the model to propose a multi-commit split (only if it makes sense). You’ll see both a single-commit message and a multi-commit plan; choose which to use or cancel. The plan groups files by intent and suggests per-commit titles/bodies. It performs file-level grouping (not hunk-level).
 
 ## Exclusions
 

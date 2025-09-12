@@ -24,3 +24,6 @@ dirs = "6.0.0"
 copypasta = "0.10.0"
 glob = "0.3.1"
 ignore = "0.4.23"
+ureq = { version = "2.9.7", features = ["json"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"

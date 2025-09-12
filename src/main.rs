@@ -21,6 +21,8 @@ use infer;
 use dirs;
 use copypasta::{ ClipboardContext, ClipboardProvider };
 use indicatif::{ ProgressBar, ProgressStyle, MultiProgress, ParallelProgressIterator };
+use std::process::Command;
+use serde::{Deserialize, Serialize};
 
 mod tree;
 use tree::DirectoryTree;
@@ -210,6 +212,13 @@ struct Args {
     /// Can be specified multiple times or as a comma-separated list
     #[arg(long = "only", value_delimiter = ',')]
     only: Vec<String>,
+
+    /// Stage and commit changes with an AI-generated message
+    /// Uses Gemini (models/gemini-2.5-flash) via GEMINI_API_KEY
+    #[arg(long)]
+    commit: bool,
+
+    // Note: Multi-commit planning is integrated into --commit; no separate flag needed.
 }
 
 #[derive(Debug, Clone)]
@@ -320,8 +329,17 @@ fn main() -> Result<()> {
         fs::create_dir_all(&args.output_dir)?;
     }
 
+    // Determine if commit is allowed (only for current directory runs)
+    let wants_commit = args.commit;
+    let commit_allowed = wants_commit && urls.len() == 1 && urls[0] == ".";
+
+    if wants_commit && !commit_allowed {
+        println!("--commit/--multi-commit only work on the current directory. Skipping commit.");
+    }
+
     // Process repositories in parallel if there are multiple
-    if urls.len() > 1 {
+    let do_parallel = urls.len() > 1;
+    if do_parallel {
         urls
             .par_iter()
             .try_for_each(|url| {
@@ -331,6 +349,7 @@ fn main() -> Result<()> {
                     Arc::clone(&stats),
                     &args,
                     copy_mode_global,
+                    commit_allowed && url == ".",
                     Arc::clone(&multi_progress)
                 )
             })?;
@@ -341,6 +360,7 @@ fn main() -> Result<()> {
             Arc::clone(&stats),
             &args,
             copy_mode_global,
+            commit_allowed,
             Arc::clone(&multi_progress)
         )?;
     }
@@ -618,6 +638,7 @@ fn process_repository(
     stats: Arc<Mutex<ProcessingStats>>,
     args: &Args,
     copy_mode: bool,
+    allow_commit: bool,
     multi_progress: Arc<MultiProgress>
 ) -> Result<()> {
     let clone_start = Instant::now();
@@ -932,6 +953,13 @@ fn process_repository(
     drop(write_pb);
     multi_progress.clear()?;
 
+    // If --commit is enabled, attempt to stage and commit changes
+    if allow_commit {
+        if let Err(e) = commit_with_ai_choice(&repo_dir) {
+            println!("Commit step skipped: {}", e);
+        }
+    }
+
     // If cursor mode is enabled, run the cursor command
     if args.open_cursor {
         let cursor_cmd = format!("cursor {}", repo_dir.display());
@@ -941,6 +969,440 @@ fn process_repository(
     }
 
     Ok(())
+}
+
+// -------------------- Commit support --------------------
+
+fn commit_with_ai_message(repo_dir: &Path) -> Result<()> {
+    // Ensure we're in a git repository
+    if !repo_dir.join(".git").exists() {
+        anyhow::bail!("Not a git repository: {}", repo_dir.display());
+    }
+
+    // Detect any changes (staged or unstaged)
+    let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
+    if status_porcelain.trim().is_empty() {
+        anyhow::bail!("no changes to commit");
+    }
+
+    // Build prompt from diff vs HEAD (includes both staged and unstaged)
+    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
+    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
+    // Keep the diff small to avoid huge payloads; include a bit of context
+    let diff_sample = run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])?;
+    let diff_sample = truncate(&diff_sample, 10_000);
+
+    let prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
+    let msg = match generate_commit_message_via_gemini(&prompt) {
+        Ok(m) => m,
+        Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
+    };
+
+    // Show and confirm
+    println!("Proposed commit message:\n\n{}", msg);
+    if !prompt_yes_no("Commit with this message? [y/N] ")? {
+        println!("Commit canceled by user.");
+        return Ok(());
+    }
+
+    // Stage all changes and commit
+    run_in_repo(repo_dir, &["git", "add", "-A"])?.to_string();
+    let commit_res = run_in_repo(repo_dir, &["git", "commit", "-m", &msg]);
+    match commit_res {
+        Ok(_) => { println!("Committed with AI message: {}", msg); Ok(()) }
+        Err(e) => Err(e),
+    }
+}
+
+fn commit_with_ai_choice(repo_dir: &Path) -> Result<()> {
+    // Ensure repo and changes
+    if !repo_dir.join(".git").exists() {
+        anyhow::bail!("Not a git repository: {}", repo_dir.display());
+    }
+    let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
+    if status_porcelain.trim().is_empty() {
+        anyhow::bail!("no changes to commit");
+    }
+
+    // Produce single-commit proposal (multi-line)
+    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
+    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
+    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])? , 20_000);
+    let single_prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
+    let single_msg = match generate_commit_message_via_gemini(&single_prompt) {
+        Ok(m) => m,
+        Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
+    };
+
+    // Try to produce multi-commit plan
+    let multi_plan = plan_multi_commits(repo_dir).ok();
+    let has_sensible_multi = multi_plan
+        .as_ref()
+        .map(|(commits, _)| commits.len() >= 2)
+        .unwrap_or(false);
+
+    // Show options
+    println!("Option A: Single commit message:\n\n{}\n", single_msg);
+    if has_sensible_multi {
+        let (commits, leftovers) = multi_plan.as_ref().unwrap();
+        println!("Option B: Multi-commit plan ({} commits):\n", commits.len());
+        for (i, c) in commits.iter().enumerate() {
+            println!("{}. {}", i + 1, c.title);
+            if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
+            println!("Files ({}):", c.files.len());
+            for f in &c.files { println!("  - {}", f); }
+            println!("");
+        }
+        if !leftovers.is_empty() {
+            println!("Leftover files not in any commit ({}):", leftovers.len());
+            for f in leftovers { println!("  - {}", f); }
+            println!("");
+        }
+    } else {
+        println!("No sensible multi-commit split proposed (showing single commit only).\n");
+    }
+
+    // Choose
+    let choice = prompt_choice(if has_sensible_multi { "Choose [a] single, [b] multi, or [c] cancel: " } else { "Choose [a] single or [c] cancel: " })?;
+    match choice.as_str() {
+        "a" => {
+            println!("\nConfirm single-commit?\n\n{}\n", single_msg);
+            if !prompt_yes_no("Commit with this message? [y/N] ")? { println!("Commit canceled."); return Ok(()); }
+            run_in_repo(repo_dir, &["git", "add", "-A"])?;
+            if let Some((subject, body)) = split_subject_body(&single_msg) {
+                if body.trim().is_empty() {
+                    run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim()])?;
+                } else {
+                    run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim(), "-m", body.trim()])?;
+                }
+            } else {
+                run_in_repo(repo_dir, &["git", "commit", "-m", single_msg.trim()])?;
+            }
+            println!("Committed with AI message.");
+            Ok(())
+        }
+        "b" if has_sensible_multi => {
+            let (commits, leftovers) = multi_plan.unwrap();
+            if !prompt_yes_no(&format!("Proceed to create {} commits? [y/N] ", commits.len()))? { println!("Multi-commit canceled."); return Ok(()); }
+            do_commits(repo_dir, &commits, &leftovers)?;
+            println!("Multi-commit completed.");
+            Ok(())
+        }
+        _ => { println!("Canceled."); Ok(()) }
+    }
+}
+
+fn run_in_repo(repo_dir: &Path, args: &[&str]) -> Result<String> {
+    let (cmd, rest) = args.split_first().ok_or_else(|| anyhow::anyhow!("empty command"))?;
+    let output = Command::new(cmd)
+        .args(rest)
+        .current_dir(repo_dir)
+        .output()
+        .with_context(|| format!("failed to run {:?}", args))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(anyhow::anyhow!(
+            "command {:?} failed: {}",
+            args, stderr.trim()
+        ))
+    }
+}
+
+fn truncate(s: &str, max: usize) -> String {
+    if s.len() <= max { s.to_string() } else { format!("{}\n…[truncated]", &s[..max]) }
+}
+
+fn prompt_yes_no(prompt: &str) -> Result<bool> {
+    use std::io::{self, Write};
+    print!("{}", prompt);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
+    let resp = input.trim().to_lowercase();
+    Ok(resp == "y" || resp == "yes")
+}
+
+fn prompt_choice(prompt: &str) -> Result<String> {
+    use std::io::{self, Write};
+    print!("{}", prompt);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
+    Ok(input.trim().to_lowercase())
+}
+
+fn split_subject_body(msg: &str) -> Option<(String, String)> {
+    let mut lines = msg.lines();
+    let subject = lines.next()?.to_string();
+    let rest: String = lines.collect::<Vec<&str>>().join("\n");
+    Some((subject, rest))
+}
+
+fn build_commit_prompt_multiline(name_status: &str, shortstat: &str, diff_sample: &str) -> String {
+    format!(
+        "You write excellent Conventional Commits. Generate a concise, multi-line commit message:\n\
+        - First line: <type>(optional-scope): <summary> (<=72 chars, no trailing period)\n\
+        - Blank line\n\
+        - Body: 3-6 bullets summarizing key changes and rationale; wrap to ~72 chars\n\
+        - Include 'BREAKING CHANGE:' line if applicable\n\
+        Prefer specific wording over generic 'update' or 'changes'.\n\
+        Changed files (name-status):\n\
+        {}\n\
+        Summary: {}\n\
+        Diff sample (truncated):\n\
+        {}\n\
+        Output ONLY the commit message text.",
+        name_status.trim(),
+        shortstat.trim(),
+        diff_sample.trim()
+    )
+}
+
+fn fallback_commit_message_multiline(name_status: &str, shortstat: &str) -> String {
+    // Simple heuristic fallback if API not available (multi-line)
+    let files: Vec<&str> = name_status
+        .lines()
+        .take(5)
+        .map(|l| l.split_whitespace().last().unwrap_or(l))
+        .collect();
+    let files_str = files.join(", ");
+    let stat = shortstat.trim();
+    let subject = if files_str.is_empty() { "chore: update files".to_string() } else { truncate(&format!("chore: update {}", files_str), 72) };
+    let body = format!("\n\n- Update files\n- Summary: {}", if stat.is_empty() { "n/a" } else { stat });
+    format!("{}{}", subject, body)
+}
+
+#[derive(Serialize)]
+struct GeminiRequest<'a> {
+    contents: Vec<GeminiContent<'a>>,
+}
+
+#[derive(Serialize)]
+struct GeminiContent<'a> {
+    parts: Vec<GeminiPart<'a>>,
+}
+
+#[derive(Serialize)]
+struct GeminiPart<'a> { text: &'a str }
+
+#[derive(Deserialize)]
+struct GeminiResponse {
+    candidates: Option<Vec<GeminiCandidate>>,    
+}
+
+#[derive(Deserialize)]
+struct GeminiCandidate {
+    content: Option<GeminiGeneratedContent>,
+}
+
+#[derive(Deserialize)]
+struct GeminiGeneratedContent {
+    parts: Option<Vec<GeminiGeneratedPart>>,   
+}
+
+#[derive(Deserialize)]
+struct GeminiGeneratedPart { text: Option<String> }
+
+fn generate_commit_message_via_gemini(prompt: &str) -> Result<String> {
+    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    let model = "gemini-2.5-flash"; // updated model
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: prompt }] }] };
+    let resp: GeminiResponse = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::to_value(&req)?)
+        .map_err(|e| anyhow::anyhow!("Gemini request failed: {}", e))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("invalid Gemini JSON: {}", e))?;
+
+    let text = resp
+        .candidates
+        .and_then(|mut v| v.pop())
+        .and_then(|c| c.content)
+        .and_then(|c| c.parts)
+        .and_then(|mut parts| parts.pop())
+        .and_then(|p| p.text)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() { anyhow::bail!("empty response from model") } else { Ok(text) }
+}
+
+// -------- Multi-commit planning --------
+
+#[derive(Debug, Deserialize)]
+struct CommitPlanResponse {
+    commits: Vec<CommitPlan>,
+}
+
+#[derive(Debug, Deserialize)]
+struct CommitPlan {
+    title: String,
+    body: Option<String>,
+    files: Vec<String>,
+}
+
+fn plan_multi_commits(repo_dir: &Path) -> Result<(Vec<CommitPlan>, Vec<String>)> {
+    // Ensure repo and changes
+    if !repo_dir.join(".git").exists() {
+        anyhow::bail!("Not a git repository: {}", repo_dir.display());
+    }
+    let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
+    if status_porcelain.trim().is_empty() {
+        anyhow::bail!("no changes to commit");
+    }
+
+    // Gather change context
+    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
+    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", "HEAD"])?;
+    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
+    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])? , 40_000);
+
+    let plan_prompt = build_multi_commit_prompt(&name_status, &numstat, &shortstat, &diff_sample);
+    let plan = match generate_commit_plan_via_gemini(&plan_prompt) {
+        Ok(p) => p,
+        Err(e) => {
+            return Err(anyhow::anyhow!("AI planning failed: {}", e));
+        }
+    };
+
+    // Collect actually changed files for validation
+    let changed_files: Vec<String> = name_status
+        .lines()
+        .filter_map(|l| l.split_whitespace().nth(1))
+        .map(|s| s.to_string())
+        .collect();
+
+    // Validate and normalize plan
+    let mut normalized: Vec<CommitPlan> = Vec::new();
+    for mut c in plan.commits {
+        c.files.retain(|f| changed_files.iter().any(|cf| cf == f));
+        if !c.title.trim().is_empty() && !c.files.is_empty() {
+            normalized.push(c);
+        }
+    }
+
+    if normalized.is_empty() {
+        anyhow::bail!("AI did not propose any valid commits");
+    }
+
+    // Determine leftovers
+    let mut included = std::collections::HashSet::new();
+    for c in &normalized { for f in &c.files { included.insert(f.clone()); } }
+    let leftovers: Vec<String> = changed_files
+        .into_iter()
+        .filter(|f| !included.contains(f))
+        .collect();
+
+    Ok((normalized, leftovers))
+}
+
+fn do_commits(repo_dir: &Path, commits: &Vec<CommitPlan>, leftovers: &Vec<String>) -> Result<()> {
+    // Execute commits in order
+    for c in commits {
+        let mut args = vec!["git", "add", "-A", "--"]; // stage specific files
+        for f in &c.files { args.push(f); }
+        run_in_repo(repo_dir, &args)?;
+
+        let subject = c.title.trim();
+        let body = c.body.as_deref().unwrap_or("").trim();
+        let commit_res = if body.is_empty() {
+            run_in_repo(repo_dir, &["git", "commit", "-m", subject])
+        } else {
+            run_in_repo(repo_dir, &["git", "commit", "-m", subject, "-m", body])
+        };
+        if let Err(e) = commit_res { return Err(e); }
+    }
+
+    if !leftovers.is_empty() {
+        println!("There are leftover files not included in the plan.");
+        if prompt_yes_no("Create a final 'chore: misc updates' commit for leftovers? [y/N] ")? {
+            let mut args = vec!["git", "add", "-A", "--"]; for f in leftovers { args.push(f); }
+            run_in_repo(repo_dir, &args)?;
+            run_in_repo(repo_dir, &["git", "commit", "-m", "chore: misc updates"]) ?;
+        }
+    }
+    Ok(())
+}
+
+fn commit_with_ai_multi(repo_dir: &Path) -> Result<()> {
+    let (commits, leftovers) = plan_multi_commits(repo_dir)?;
+
+    println!("Proposed multi-commit plan:\n");
+    for (i, c) in commits.iter().enumerate() {
+        println!("{}. {}", i + 1, c.title);
+        if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
+        println!("Files ({}):", c.files.len());
+        for f in &c.files { println!("  - {}", f); }
+        println!("");
+    }
+    if !leftovers.is_empty() {
+        println!("Leftover files not in any commit ({}):", leftovers.len());
+        for f in &leftovers { println!("  - {}", f); }
+        println!("");
+    }
+    if !prompt_yes_no(&format!("Proceed to create {} commits? [y/N] ", commits.len()))? {
+        println!("Multi-commit canceled by user.");
+        return Ok(());
+    }
+    do_commits(repo_dir, &commits, &leftovers)?;
+    println!("Multi-commit completed.");
+    Ok(())
+}
+
+fn build_multi_commit_prompt(name_status: &str, numstat: &str, shortstat: &str, diff_sample: &str) -> String {
+    format!(
+        "Analyze the following changes and propose a set of logical commits.\n\
+        Output STRICT JSON with this schema: {{\"commits\":[{{\"title\":string,\"body\":string,\"files\":[string]}}]}}.\n\
+        Rules:\n\
+        - Group changes by intent/scope so each commit is meaningful.\n\
+        - Use Conventional Commit titles (<=72 chars).\n\
+        - Body should briefly explain rationale and key changes (optional).\n\
+        - Assign each changed file to at most one commit.\n\
+        Changed files (name-status):\n{}\n\
+        Per-file stats (numstat):\n{}\n\
+        Summary: {}\n\
+        Diff sample (truncated):\n{}\n\
+        JSON only.",
+        name_status.trim(), numstat.trim(), shortstat.trim(), diff_sample.trim()
+    )
+}
+
+fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
+    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    let model = "gemini-2.5-flash";
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: prompt }] }] };
+    let resp: GeminiResponse = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::to_value(&req)?)
+        .map_err(|e| anyhow::anyhow!("Gemini request failed: {}", e))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("invalid Gemini JSON: {}", e))?;
+
+    let text = resp
+        .candidates
+        .and_then(|mut v| v.pop())
+        .and_then(|c| c.content)
+        .and_then(|c| c.parts)
+        .and_then(|mut parts| parts.pop())
+        .and_then(|p| p.text)
+        .ok_or_else(|| anyhow::anyhow!("empty model response"))?;
+
+    // Attempt to parse the returned text as JSON plan
+    let plan: CommitPlanResponse = serde_json::from_str(text.trim())
+        .map_err(|e| anyhow::anyhow!("failed to parse plan JSON: {}", e))?;
+    Ok(plan)
 }
 
 fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
