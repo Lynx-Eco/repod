@@ -192,9 +192,14 @@ struct Args {
     #[arg(long)]
     at: Option<String>,
 
-    /// Copy output to clipboard instead of saving to file
+    /// Copy output to clipboard instead of saving to file (explicit)
+    /// Default behavior is computed: copies for single-target runs unless --write or -o is set
     #[arg(long)]
     copy: bool,
+
+    /// Write output to file instead of copying to clipboard (overrides default copy behavior)
+    #[arg(long)]
+    write: bool,
 
     /// Additional folder or path patterns to exclude from processing
     /// Can be specified multiple times or as a comma‑separated list
@@ -291,8 +296,27 @@ fn main() -> Result<()> {
     let stats = Arc::new(Mutex::new(ProcessingStats::default()));
     let multi_progress = Arc::new(MultiProgress::new());
 
-    // Only create output directory if we're not copying to clipboard
-    if !args.copy {
+    // Determine effective copy/write mode
+    // Rules:
+    // - --write forces writing to file
+    // - --copy forces copying to clipboard
+    // - Default (neither provided):
+    //     * If multiple targets (CSV / multiple URLs): write to file to avoid clipboard races
+    //     * Else if output_dir changed from default: write to file
+    //     * Else: copy to clipboard
+    let multiple_targets = urls.len() > 1;
+    let copy_mode_global = if args.write {
+        false
+    } else if args.copy {
+        true
+    } else if multiple_targets || args.output_dir != "output" {
+        false
+    } else {
+        true
+    };
+
+    // Only create output directory if we're writing to files
+    if !copy_mode_global {
         fs::create_dir_all(&args.output_dir)?;
     }
 
@@ -306,6 +330,7 @@ fn main() -> Result<()> {
                     &args.output_dir,
                     Arc::clone(&stats),
                     &args,
+                    copy_mode_global,
                     Arc::clone(&multi_progress)
                 )
             })?;
@@ -315,6 +340,7 @@ fn main() -> Result<()> {
             &args.output_dir,
             Arc::clone(&stats),
             &args,
+            copy_mode_global,
             Arc::clone(&multi_progress)
         )?;
     }
@@ -591,6 +617,7 @@ fn process_repository(
     output_dir: &str,
     stats: Arc<Mutex<ProcessingStats>>,
     args: &Args,
+    copy_mode: bool,
     multi_progress: Arc<MultiProgress>
 ) -> Result<()> {
     let clone_start = Instant::now();
@@ -868,7 +895,7 @@ fn process_repository(
     }
 
     // Handle output based on mode
-    if args.copy {
+    if copy_mode {
         // Copy to clipboard
         let content = String::from_utf8(output_buffer)?;
         let mut ctx = ClipboardContext::new().map_err(|e|
