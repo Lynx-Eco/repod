@@ -1158,6 +1158,14 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
     };
     pb.finish_with_message("Single-commit proposal ready");
 
+    // Show message and confirm
+    println!("Proposed commit message:\n\n{}\n", msg);
+    if !prompt_yes_no("Commit with this message? [y/N] ")? {
+        println!("Commit canceled.");
+        return Ok(());
+    }
+
+    // Stage and commit
     run_in_repo(repo_dir, &["git", "add", "-A"]) ?;
     if let Some((subject, body)) = split_subject_body(&msg) {
         if body.trim().is_empty() {
@@ -1213,11 +1221,28 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Resu
         for f in &leftovers { println!("  - {}", f); }
         println!("");
     }
-    if !prompt_yes_no(&format!("Proceed to create {} commits? [y/N] ", commits.len()))? {
-        println!("Multi-commit canceled.");
-        return Ok(());
+    // Confirm and apply each commit individually
+    for (i, c) in commits.iter().enumerate() {
+        println!("Apply commit {}/{}: {}", i + 1, commits.len(), c.title);
+        if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
+        println!("Files ({}):", c.files.len());
+        for f in &c.files { println!("  - {}", f); }
+        if prompt_yes_no("Commit this change? [y/N] ")? {
+            let mut add_args = vec!["git".to_string(), "add".to_string(), "-A".to_string(), "--".to_string()];
+            for f in &c.files { add_args.push(f.clone()); }
+            run_in_repo_strings(repo_dir, add_args)?;
+
+            let subject = c.title.trim().to_string();
+            let body = c.body.as_deref().unwrap_or("").trim().to_string();
+            if body.is_empty() {
+                run_in_repo(repo_dir, &["git", "commit", "-m", &subject])?;
+            } else {
+                run_in_repo(repo_dir, &["git", "commit", "-m", &subject, "-m", &body])?;
+            }
+        } else {
+            println!("Skipped.");
+        }
     }
-    do_commits(repo_dir, &commits, &leftovers)?;
 
     let post_leftovers = list_changed_files_vs_head(repo_dir)?;
     if !post_leftovers.is_empty() {
