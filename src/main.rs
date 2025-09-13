@@ -23,6 +23,8 @@ use copypasta::{ ClipboardContext, ClipboardProvider };
 use indicatif::{ ProgressBar, ProgressStyle, MultiProgress, ParallelProgressIterator };
 use std::process::Command;
 use serde::{Deserialize, Serialize};
+use std::ffi::OsStr;
+use crossterm::{terminal, event::{read, Event, KeyCode}};
 
 mod tree;
 use tree::DirectoryTree;
@@ -305,6 +307,10 @@ fn main() -> Result<()> {
     let stats = Arc::new(Mutex::new(ProcessingStats::default()));
     let multi_progress = Arc::new(MultiProgress::new());
 
+    // Determine if commit is allowed (only for current directory runs)
+    let wants_commit = args.commit;
+    let commit_allowed = wants_commit && urls.len() == 1 && urls[0] == ".";
+
     // Determine effective copy/write mode
     // Rules:
     // - --write forces writing to file
@@ -324,14 +330,10 @@ fn main() -> Result<()> {
         true
     };
 
-    // Only create output directory if we're writing to files
-    if !copy_mode_global {
+    // Only create output directory if we're writing to files and not in commit-only mode
+    if !copy_mode_global && !commit_allowed {
         fs::create_dir_all(&args.output_dir)?;
     }
-
-    // Determine if commit is allowed (only for current directory runs)
-    let wants_commit = args.commit;
-    let commit_allowed = wants_commit && urls.len() == 1 && urls[0] == ".";
 
     if wants_commit && !commit_allowed {
         println!("--commit/--multi-commit only work on the current directory. Skipping commit.");
@@ -366,7 +368,9 @@ fn main() -> Result<()> {
     }
 
     let final_stats = stats.lock();
-    print_stats(&final_stats);
+    if !commit_allowed {
+        print_stats(&final_stats);
+    }
     Ok(())
 }
 
@@ -682,6 +686,12 @@ fn process_repository(
         }
     }
 
+    // If commit-only mode is enabled, skip scanning/output and just run commit flow
+    if allow_commit {
+        commit_with_ai_choice(&repo_dir, &multi_progress)?;
+        return Ok(());
+    }
+
     let process_start = Instant::now();
 
     // Create tokenizer once
@@ -953,13 +963,6 @@ fn process_repository(
     drop(write_pb);
     multi_progress.clear()?;
 
-    // If --commit is enabled, attempt to stage and commit changes
-    if allow_commit {
-        if let Err(e) = commit_with_ai_choice(&repo_dir) {
-            println!("Commit step skipped: {}", e);
-        }
-    }
-
     // If cursor mode is enabled, run the cursor command
     if args.open_cursor {
         let cursor_cmd = format!("cursor {}", repo_dir.display());
@@ -1014,7 +1017,7 @@ fn commit_with_ai_message(repo_dir: &Path) -> Result<()> {
     }
 }
 
-fn commit_with_ai_choice(repo_dir: &Path) -> Result<()> {
+fn commit_with_ai_choice(repo_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
     // Ensure repo and changes
     if !repo_dir.join(".git").exists() {
         anyhow::bail!("Not a git repository: {}", repo_dir.display());
@@ -1028,14 +1031,24 @@ fn commit_with_ai_choice(repo_dir: &Path) -> Result<()> {
     let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
     let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
     let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])? , 20_000);
+    let pb_single = multi_progress.add(ProgressBar::new_spinner());
+    pb_single.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb_single.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb_single.set_message("Generating single-commit proposal...");
     let single_prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
     let single_msg = match generate_commit_message_via_gemini(&single_prompt) {
         Ok(m) => m,
         Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
     };
+    pb_single.finish_with_message("Single-commit proposal ready");
 
     // Try to produce multi-commit plan
-    let multi_plan = plan_multi_commits(repo_dir).ok();
+    let pb_multi = multi_progress.add(ProgressBar::new_spinner());
+    pb_multi.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb_multi.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb_multi.set_message("Analyzing multi-commit plan...");
+    let multi_plan = plan_multi_commits(repo_dir, multi_progress).ok();
+    pb_multi.finish_with_message("Multi-commit analysis complete");
     let has_sensible_multi = multi_plan
         .as_ref()
         .map(|(commits, _)| commits.len() >= 2)
@@ -1063,11 +1076,10 @@ fn commit_with_ai_choice(repo_dir: &Path) -> Result<()> {
     }
 
     // Choose
-    let choice = prompt_choice(if has_sensible_multi { "Choose [a] single, [b] multi, or [c] cancel: " } else { "Choose [a] single or [c] cancel: " })?;
-    match choice.as_str() {
-        "a" => {
-            println!("\nConfirm single-commit?\n\n{}\n", single_msg);
-            if !prompt_yes_no("Commit with this message? [y/N] ")? { println!("Commit canceled."); return Ok(()); }
+    let choice = prompt_choice_keypress(if has_sensible_multi { "Choose [a] single, [b] multi, or [c] cancel: " } else { "Choose [a] single or [c] cancel: " }, if has_sensible_multi { &['a','b','c'] } else { &['a','c'] })?;
+    match choice {
+        'a' => {
+            // Directly commit without extra confirmation
             run_in_repo(repo_dir, &["git", "add", "-A"])?;
             if let Some((subject, body)) = split_subject_body(&single_msg) {
                 if body.trim().is_empty() {
@@ -1079,12 +1091,33 @@ fn commit_with_ai_choice(repo_dir: &Path) -> Result<()> {
                 run_in_repo(repo_dir, &["git", "commit", "-m", single_msg.trim()])?;
             }
             println!("Committed with AI message.");
+
+            // Check for leftover changes and offer AI commit
+            let leftovers = list_changed_files_vs_head(repo_dir)?;
+            if !leftovers.is_empty() {
+                println!("There are leftover uncommitted files ({}).", leftovers.len());
+                for f in &leftovers { println!("  - {}", f); }
+                if prompt_yes_no("Generate AI commit for leftovers? [y/N] ")? {
+                    commit_files_with_ai(repo_dir, &leftovers, multi_progress)?;
+                    println!("Leftover files committed.");
+                }
+            }
             Ok(())
         }
-        "b" if has_sensible_multi => {
+        'b' if has_sensible_multi => {
             let (commits, leftovers) = multi_plan.unwrap();
-            if !prompt_yes_no(&format!("Proceed to create {} commits? [y/N] ", commits.len()))? { println!("Multi-commit canceled."); return Ok(()); }
+            // Directly execute multi-commit plan
             do_commits(repo_dir, &commits, &leftovers)?;
+            // After executing plan, if leftovers remain (e.g., files added during run), offer AI commit
+            let post_leftovers = if leftovers.is_empty() { list_changed_files_vs_head(repo_dir)? } else { leftovers.clone() };
+            if !post_leftovers.is_empty() {
+                println!("There are leftover uncommitted files ({}).", post_leftovers.len());
+                for f in &post_leftovers { println!("  - {}", f); }
+                if prompt_yes_no("Generate AI commit for leftovers? [y/N] ")? {
+                    commit_files_with_ai(repo_dir, &post_leftovers, multi_progress)?;
+                    println!("Leftover files committed.");
+                }
+            }
             println!("Multi-commit completed.");
             Ok(())
         }
@@ -1124,13 +1157,33 @@ fn prompt_yes_no(prompt: &str) -> Result<bool> {
     Ok(resp == "y" || resp == "yes")
 }
 
-fn prompt_choice(prompt: &str) -> Result<String> {
-    use std::io::{self, Write};
+fn prompt_choice_keypress(prompt: &str, allowed: &[char]) -> Result<char> {
+    use std::io::Write;
     print!("{}", prompt);
-    io::stdout().flush().ok();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
-    Ok(input.trim().to_lowercase())
+    std::io::stdout().flush().ok();
+    terminal::enable_raw_mode().map_err(|e| anyhow::anyhow!("failed to enable raw mode: {}", e))?;
+    let res = loop {
+        match read() {
+            Ok(Event::Key(key)) => match key.code {
+                KeyCode::Char(c) => {
+                    let cl = c.to_ascii_lowercase();
+                    if allowed.contains(&cl) {
+                        // echo selection and newline for feedback
+                        print!("{}\n", c);
+                        std::io::stdout().flush().ok();
+                        break Ok(cl);
+                    }
+                }
+                KeyCode::Esc => break Ok('c'),
+                KeyCode::Enter => { /* ignore */ }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => break Err(anyhow::anyhow!("failed to read key: {}", e)),
+        }
+    };
+    terminal::disable_raw_mode().ok();
+    res
 }
 
 fn split_subject_body(msg: &str) -> Option<(String, String)> {
@@ -1248,7 +1301,7 @@ struct CommitPlan {
     files: Vec<String>,
 }
 
-fn plan_multi_commits(repo_dir: &Path) -> Result<(Vec<CommitPlan>, Vec<String>)> {
+fn plan_multi_commits(repo_dir: &Path, _multi_progress: &MultiProgress) -> Result<(Vec<CommitPlan>, Vec<String>)> {
     // Ensure repo and changes
     if !repo_dir.join(".git").exists() {
         anyhow::bail!("Not a git repository: {}", repo_dir.display());
@@ -1303,7 +1356,7 @@ fn plan_multi_commits(repo_dir: &Path) -> Result<(Vec<CommitPlan>, Vec<String>)>
     Ok((normalized, leftovers))
 }
 
-fn do_commits(repo_dir: &Path, commits: &Vec<CommitPlan>, leftovers: &Vec<String>) -> Result<()> {
+fn do_commits(repo_dir: &Path, commits: &Vec<CommitPlan>, _leftovers: &Vec<String>) -> Result<()> {
     // Execute commits in order
     for c in commits {
         let mut args = vec!["git", "add", "-A", "--"]; // stage specific files
@@ -1320,39 +1373,7 @@ fn do_commits(repo_dir: &Path, commits: &Vec<CommitPlan>, leftovers: &Vec<String
         if let Err(e) = commit_res { return Err(e); }
     }
 
-    if !leftovers.is_empty() {
-        println!("There are leftover files not included in the plan.");
-        if prompt_yes_no("Create a final 'chore: misc updates' commit for leftovers? [y/N] ")? {
-            let mut args = vec!["git", "add", "-A", "--"]; for f in leftovers { args.push(f); }
-            run_in_repo(repo_dir, &args)?;
-            run_in_repo(repo_dir, &["git", "commit", "-m", "chore: misc updates"]) ?;
-        }
-    }
-    Ok(())
-}
-
-fn commit_with_ai_multi(repo_dir: &Path) -> Result<()> {
-    let (commits, leftovers) = plan_multi_commits(repo_dir)?;
-
-    println!("Proposed multi-commit plan:\n");
-    for (i, c) in commits.iter().enumerate() {
-        println!("{}. {}", i + 1, c.title);
-        if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
-        println!("Files ({}):", c.files.len());
-        for f in &c.files { println!("  - {}", f); }
-        println!("");
-    }
-    if !leftovers.is_empty() {
-        println!("Leftover files not in any commit ({}):", leftovers.len());
-        for f in &leftovers { println!("  - {}", f); }
-        println!("");
-    }
-    if !prompt_yes_no(&format!("Proceed to create {} commits? [y/N] ", commits.len()))? {
-        println!("Multi-commit canceled by user.");
-        return Ok(());
-    }
-    do_commits(repo_dir, &commits, &leftovers)?;
-    println!("Multi-commit completed.");
+    // Leave handling of leftovers to the caller (they may choose AI commit)
     Ok(())
 }
 
@@ -1403,6 +1424,78 @@ fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
     let plan: CommitPlanResponse = serde_json::from_str(text.trim())
         .map_err(|e| anyhow::anyhow!("failed to parse plan JSON: {}", e))?;
     Ok(plan)
+}
+
+// -------- Leftover helpers --------
+
+fn list_changed_files_vs_head(repo_dir: &Path) -> Result<Vec<String>> {
+    let out = run_in_repo(repo_dir, &["git", "diff", "--name-only", "HEAD"])?;
+    let files: Vec<String> = out
+        .lines()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect();
+    Ok(files)
+}
+
+fn run_in_repo_strings(repo_dir: &Path, args: Vec<String>) -> Result<String> {
+    let mut it = args.iter();
+    let cmd = it.next().ok_or_else(|| anyhow::anyhow!("empty command"))?;
+    let output = Command::new(OsStr::new(cmd))
+        .args(&args[1..])
+        .current_dir(repo_dir)
+        .output()
+        .with_context(|| format!("failed to run {:?}", args))?;
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        Err(anyhow::anyhow!("command {:?} failed: {}", args, stderr.trim()))
+    }
+}
+
+fn diff_context_for_files(repo_dir: &Path, files: &Vec<String>) -> Result<(String, String, String)> {
+    let mut name_status_args = vec!["git".to_string(), "diff".to_string(), "--name-status".to_string(), "HEAD".to_string(), "--".to_string()];
+    let mut shortstat_args = vec!["git".to_string(), "diff".to_string(), "--shortstat".to_string(), "HEAD".to_string(), "--".to_string()];
+    let mut diff_args = vec!["git".to_string(), "diff".to_string(), "-U3".to_string(), "HEAD".to_string(), "--".to_string()];
+    for f in files { name_status_args.push(f.clone()); shortstat_args.push(f.clone()); diff_args.push(f.clone()); }
+    let name_status = run_in_repo_strings(repo_dir, name_status_args)?;
+    let shortstat = run_in_repo_strings(repo_dir, shortstat_args)?;
+    let diff_sample = truncate(&run_in_repo_strings(repo_dir, diff_args)?, 20_000);
+    Ok((name_status, shortstat, diff_sample))
+}
+
+fn commit_files_with_ai(repo_dir: &Path, files: &Vec<String>, multi_progress: &MultiProgress) -> Result<()> {
+    if files.is_empty() { return Ok(()); }
+    let pb = multi_progress.add(ProgressBar::new_spinner());
+    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb.set_message("Generating commit for leftovers...");
+
+    let (name_status, shortstat, diff_sample) = diff_context_for_files(repo_dir, files)?;
+    let prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
+    let msg = match generate_commit_message_via_gemini(&prompt) {
+        Ok(m) => m,
+        Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
+    };
+    pb.finish_with_message("Leftover commit proposal ready");
+
+    // Stage only these files and commit
+    let mut add_args = vec!["git".to_string(), "add".to_string(), "-A".to_string(), "--".to_string()];
+    for f in files { add_args.push(f.clone()); }
+    run_in_repo_strings(repo_dir, add_args)?;
+
+    if let Some((subject, body)) = split_subject_body(&msg) {
+        if body.trim().is_empty() {
+            run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim()])?;
+        } else {
+            run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim(), "-m", body.trim()])?;
+        }
+    } else {
+        run_in_repo(repo_dir, &["git", "commit", "-m", msg.trim()])?;
+    }
+    Ok(())
 }
 
 fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
