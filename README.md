@@ -40,6 +40,10 @@ cp target/release/repod ~/.local/bin/
 # The binary will be in target/release/repod
 ```
 
+## Contributing
+
+Contributions are welcome! Please see CONTRIBUTING.md for guidelines. For security concerns, see SECURITY.md.
+
 ## Usage
 
 ```bash
@@ -76,9 +80,12 @@ repod https://github.com/username/repo --at /path/to/clone
 # Open in Cursor IDE after cloning
 repod git@github.com:username/repo.git --open-cursor
 
-# Stage and commit changes with AI message (uses GEMINI_API_KEY, interactive confirm)
+# Stage and commit changes with AI (single commit)
 # Note: --commit only works on the current directory
 repod --commit
+
+# Propose and apply multiple commits (current directory only)
+repod --multi-commit
 
 ```
 
@@ -113,8 +120,8 @@ Options:
       --at <AT>                  Specific path to clone the repository to
       --copy                     Copy output to clipboard (explicit)
       --write                    Write output to file (overrides default copy behavior)
-      --commit                   Stage and commit changes with an AI-generated message (interactive; uses GEMINI_API_KEY; current directory only)
-      
+      --commit                   Single AI-generated commit (uses GEMINI_API_KEY; current directory only)
+      --multi-commit             AI-proposed multi-commit plan (interactive; uses GEMINI_API_KEY; current directory only)
   -h, --help                     Print help
   -V, --version                  Print version
 ```
@@ -185,7 +192,7 @@ Notes:
 
 ## AI Commit Messages
 
-When `--commit` is provided, the tool proposes a Conventional Commit message with a subject and a short body based on your current diff (against `HEAD`), and also evaluates a multi-commit split when it makes sense. You select with a single keypress (press `a` for single, `b` for multi if shown, or `c` to cancel — no Enter needed). It uses Google’s Gemini model `models/gemini-2.5-flash` via the Generative Language API and commits immediately after your selection.
+When `--commit` is provided, the tool proposes a Conventional Commit message with a subject and a short body based on your current diff (against `HEAD`). It uses Google’s Gemini model `models/gemini-2.5-flash` via the Generative Language API and commits immediately.
 
 Important: `--commit` only works when processing the current directory (no CSV or remote URL). For other inputs, the commit step is skipped.
 
@@ -200,9 +207,15 @@ Behavior:
 - If there are no changes to commit, the step is skipped.
 - The message uses Conventional Commits (e.g., `feat: add search filter`) and includes a brief body.
 - `--commit` is ignored for CSV or remote URLs; no commits are performed in those modes.
- - After committing, if there are leftover uncommitted files, you’ll be prompted to generate one more AI commit for just those files.
+- After committing, if there are leftover uncommitted files, you’ll be prompted to generate one more AI commit for just those files.
 
-Multi-commit planning: When `--commit` is used, the tool will also ask the model to propose a multi-commit split (only if it makes sense). You’ll see both a single-commit message and a multi-commit plan; choose which to use or cancel. The plan groups files by intent and suggests per-commit titles/bodies. It performs file-level grouping (not hunk-level).
+### Multi-Commit Planning (`--multi-commit`)
+
+The tool analyzes all changes and proposes a set of smaller, logical commits. It shows a summary of each commit (title, optional body, and files included), and prompts for confirmation. If accepted, it stages the files per commit and creates the commits in order. Any remaining files can optionally be committed at the end.
+
+Notes:
+- Planning uses file-level grouping (not hunk-level).
+- You can review the plan before execution and cancel if it doesn’t look right.
 
 ## Exclusions
 

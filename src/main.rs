@@ -215,12 +215,15 @@ struct Args {
     #[arg(long = "only", value_delimiter = ',')]
     only: Vec<String>,
 
-    /// Stage and commit changes with an AI-generated message
+    /// Stage and commit changes with an AI-generated message (single commit)
     /// Uses Gemini (models/gemini-2.5-flash) via GEMINI_API_KEY
     #[arg(long)]
     commit: bool,
 
-    // Note: Multi-commit planning is integrated into --commit; no separate flag needed.
+    /// Analyze changes and propose multiple commits (current directory only)
+    /// Uses Gemini (models/gemini-2.5-flash) via GEMINI_API_KEY
+    #[arg(long = "multi-commit")]
+    multi_commit: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -308,7 +311,7 @@ fn main() -> Result<()> {
     let multi_progress = Arc::new(MultiProgress::new());
 
     // Determine if commit is allowed (only for current directory runs)
-    let wants_commit = args.commit;
+    let wants_commit = args.commit || args.multi_commit;
     let commit_allowed = wants_commit && urls.len() == 1 && urls[0] == ".";
 
     // Determine effective copy/write mode
@@ -688,7 +691,11 @@ fn process_repository(
 
     // If commit-only mode is enabled, skip scanning/output and just run commit flow
     if allow_commit {
-        commit_with_ai_choice(&repo_dir, &multi_progress)?;
+        if args.multi_commit {
+            commit_with_ai_multi(&repo_dir, &multi_progress)?;
+        } else if args.commit {
+            commit_with_ai_single(&repo_dir, &multi_progress)?;
+        }
         return Ok(());
     }
 
@@ -985,7 +992,8 @@ fn commit_with_ai_message(repo_dir: &Path) -> Result<()> {
     // Detect any changes (staged or unstaged)
     let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
     if status_porcelain.trim().is_empty() {
-        anyhow::bail!("no changes to commit");
+        println!("No changes detected. Nothing to commit.");
+        return Ok(());
     }
 
     // Build prompt from diff vs HEAD (includes both staged and unstaged)
@@ -1123,6 +1131,105 @@ fn commit_with_ai_choice(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
         }
         _ => { println!("Canceled."); Ok(()) }
     }
+}
+
+fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
+    if !repo_dir.join(".git").exists() {
+        println!("Not a git repository: {}", repo_dir.display());
+        return Ok(());
+    }
+    let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
+    if status_porcelain.trim().is_empty() {
+        println!("No changes detected. Nothing to commit.");
+        return Ok(());
+    }
+
+    let pb = multi_progress.add(ProgressBar::new_spinner());
+    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb.set_message("Generating single-commit proposal...");
+    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
+    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
+    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])? , 20_000);
+    let prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
+    let msg = match generate_commit_message_via_gemini(&prompt) {
+        Ok(m) => m,
+        Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
+    };
+    pb.finish_with_message("Single-commit proposal ready");
+
+    run_in_repo(repo_dir, &["git", "add", "-A"]) ?;
+    if let Some((subject, body)) = split_subject_body(&msg) {
+        if body.trim().is_empty() {
+            run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim()])?;
+        } else {
+            run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim(), "-m", body.trim()])?;
+        }
+    } else {
+        run_in_repo(repo_dir, &["git", "commit", "-m", msg.trim()])?;
+    }
+    println!("Committed with AI message.");
+
+    let leftovers = list_changed_files_vs_head(repo_dir)?;
+    if !leftovers.is_empty() {
+        println!("There are leftover uncommitted files ({}).", leftovers.len());
+        for f in &leftovers { println!("  - {}", f); }
+        if prompt_yes_no("Generate AI commit for leftovers? [y/N] ")? {
+            commit_files_with_ai(repo_dir, &leftovers, multi_progress)?;
+            println!("Leftover files committed.");
+        }
+    }
+    Ok(())
+}
+
+fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
+    if !repo_dir.join(".git").exists() {
+        println!("Not a git repository: {}", repo_dir.display());
+        return Ok(());
+    }
+    let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
+    if status_porcelain.trim().is_empty() {
+        println!("No changes detected. Nothing to commit.");
+        return Ok(());
+    }
+
+    let pb = multi_progress.add(ProgressBar::new_spinner());
+    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb.set_message("Analyzing multi-commit plan...");
+    let (commits, leftovers) = plan_multi_commits(repo_dir, multi_progress)?;
+    pb.finish_with_message("Multi-commit analysis complete");
+
+    println!("Proposed multi-commit plan:\n");
+    for (i, c) in commits.iter().enumerate() {
+        println!("{}. {}", i + 1, c.title);
+        if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
+        println!("Files ({}):", c.files.len());
+        for f in &c.files { println!("  - {}", f); }
+        println!("");
+    }
+    if !leftovers.is_empty() {
+        println!("Leftover files not in any commit ({}):", leftovers.len());
+        for f in &leftovers { println!("  - {}", f); }
+        println!("");
+    }
+    if !prompt_yes_no(&format!("Proceed to create {} commits? [y/N] ", commits.len()))? {
+        println!("Multi-commit canceled.");
+        return Ok(());
+    }
+    do_commits(repo_dir, &commits, &leftovers)?;
+
+    let post_leftovers = list_changed_files_vs_head(repo_dir)?;
+    if !post_leftovers.is_empty() {
+        println!("There are leftover uncommitted files ({}).", post_leftovers.len());
+        for f in &post_leftovers { println!("  - {}", f); }
+        if prompt_yes_no("Generate AI commit for leftovers? [y/N] ")? {
+            commit_files_with_ai(repo_dir, &post_leftovers, multi_progress)?;
+            println!("Leftover files committed.");
+        }
+    }
+    println!("Multi-commit completed.");
+    Ok(())
 }
 
 fn run_in_repo(repo_dir: &Path, args: &[&str]) -> Result<String> {
