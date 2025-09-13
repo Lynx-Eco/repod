@@ -25,6 +25,7 @@ use std::process::Command;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use crossterm::{terminal, event::{read, Event, KeyCode}};
+use crossterm::style::Stylize;
 
 mod tree;
 use tree::DirectoryTree;
@@ -691,6 +692,8 @@ fn process_repository(
 
     // If commit-only mode is enabled, skip scanning/output and just run commit flow
     if allow_commit {
+        // On first use of commit features, ensure GEMINI_API_KEY is configured
+        ensure_gemini_api_key_interactive()?;
         if args.multi_commit {
             commit_with_ai_multi(&repo_dir, &multi_progress)?;
         } else if args.commit {
@@ -1134,13 +1137,14 @@ fn commit_with_ai_choice(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
 }
 
 fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
+    print_title("AI Commit (Single)");
     if !repo_dir.join(".git").exists() {
-        println!("Not a git repository: {}", repo_dir.display());
+        print_warn(&format!("Not a git repository: {}", repo_dir.display()));
         return Ok(());
     }
     let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
     if status_porcelain.trim().is_empty() {
-        println!("No changes detected. Nothing to commit.");
+        print_info("No changes detected. Nothing to commit.");
         return Ok(());
     }
 
@@ -1156,12 +1160,12 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
         Ok(m) => m,
         Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
     };
-    pb.finish_with_message("Single-commit proposal ready");
+    pb.finish_with_message(format!("{}", "Single-commit proposal ready".to_string().green().bold()));
 
     // Show message and confirm
-    println!("Proposed commit message:\n\n{}\n", msg);
-    if !prompt_yes_no_keypress("Commit with this message? [y/N] ")? {
-        println!("Commit canceled.");
+    print_boxed("Proposed Commit", &msg);
+    if !prompt_yes_no_keypress("› Commit with this message? [y/N] ")? {
+        print_info("Commit canceled.");
         return Ok(());
     }
 
@@ -1176,28 +1180,29 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
     } else {
         run_in_repo(repo_dir, &["git", "commit", "-m", msg.trim()])?;
     }
-    println!("Committed with AI message.");
+    print_success("Committed.");
 
     let leftovers = list_changed_files_vs_head(repo_dir)?;
     if !leftovers.is_empty() {
-        println!("There are leftover uncommitted files ({}).", leftovers.len());
-        for f in &leftovers { println!("  - {}", f); }
-        if prompt_yes_no_keypress("Generate AI commit for leftovers? [y/N] ")? {
+        print_warn(&format!("Leftover uncommitted files: {}", leftovers.len()));
+        for f in &leftovers { println!("  • {}", f); }
+        if prompt_yes_no_keypress("› Generate AI commit for leftovers? [y/N] ")? {
             commit_files_with_ai(repo_dir, &leftovers, multi_progress)?;
-            println!("Leftover files committed.");
+            print_success("Leftover files committed.");
         }
     }
     Ok(())
 }
 
 fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
+    print_title("AI Commit (Multi)");
     if !repo_dir.join(".git").exists() {
-        println!("Not a git repository: {}", repo_dir.display());
+        print_warn(&format!("Not a git repository: {}", repo_dir.display()));
         return Ok(());
     }
     let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
     if status_porcelain.trim().is_empty() {
-        println!("No changes detected. Nothing to commit.");
+        print_info("No changes detected. Nothing to commit.");
         return Ok(());
     }
 
@@ -1206,7 +1211,7 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Resu
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("Analyzing multi-commit plan...");
     let (commits, leftovers) = plan_multi_commits(repo_dir, multi_progress)?;
-    pb.finish_with_message("Multi-commit analysis complete");
+    pb.finish_with_message(format!("{}", "Multi-commit analysis complete".to_string().green().bold()));
 
     println!("Proposed multi-commit plan:\n");
     for (i, c) in commits.iter().enumerate() {
@@ -1217,8 +1222,8 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Resu
         println!("");
     }
     if !leftovers.is_empty() {
-        println!("Leftover files not in any commit ({}):", leftovers.len());
-        for f in &leftovers { println!("  - {}", f); }
+        print_warn(&format!("Leftover files not in any commit: {}", leftovers.len()));
+        for f in &leftovers { println!("  • {}", f); }
         println!("");
     }
     // Confirm and apply each commit individually
@@ -1246,14 +1251,14 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Resu
 
     let post_leftovers = list_changed_files_vs_head(repo_dir)?;
     if !post_leftovers.is_empty() {
-        println!("There are leftover uncommitted files ({}).", post_leftovers.len());
-        for f in &post_leftovers { println!("  - {}", f); }
-        if prompt_yes_no_keypress("Generate AI commit for leftovers? [y/N] ")? {
+        print_warn(&format!("Leftover uncommitted files: {}", post_leftovers.len()));
+        for f in &post_leftovers { println!("  • {}", f); }
+        if prompt_yes_no_keypress("› Generate AI commit for leftovers? [y/N] ")? {
             commit_files_with_ai(repo_dir, &post_leftovers, multi_progress)?;
-            println!("Leftover files committed.");
+            print_success("Leftover files committed.");
         }
     }
-    println!("Multi-commit completed.");
+    print_success("Multi-commit completed.");
     Ok(())
 }
 
@@ -1628,13 +1633,14 @@ fn commit_files_with_ai(repo_dir: &Path, files: &Vec<String>, multi_progress: &M
         Ok(m) => m,
         Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
     };
-    pb.finish_with_message("Leftover commit proposal ready");
+    pb.finish_with_message(format!("{}", "Leftover commit proposal ready".to_string().green().bold()));
 
     // Stage only these files and commit
     let mut add_args = vec!["git".to_string(), "add".to_string(), "-A".to_string(), "--".to_string()];
     for f in files { add_args.push(f.clone()); }
     run_in_repo_strings(repo_dir, add_args)?;
 
+    print_boxed("Leftover Commit", &msg);
     if let Some((subject, body)) = split_subject_body(&msg) {
         if body.trim().is_empty() {
             run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim()])?;
@@ -1644,6 +1650,92 @@ fn commit_files_with_ai(repo_dir: &Path, files: &Vec<String>, multi_progress: &M
     } else {
         run_in_repo(repo_dir, &["git", "commit", "-m", msg.trim()])?;
     }
+    Ok(())
+}
+
+// -------------------- Pretty printing helpers --------------------
+
+fn print_title(title: &str) {
+    let line = hr();
+    println!("{}", line.clone().dark_grey());
+    println!("{} {}", "»".cyan().bold(), title.bold());
+    println!("{}", line.dark_grey());
+}
+
+fn print_success(msg: &str) { println!("{} {}", "✓".green().bold(), msg); }
+fn print_info(msg: &str) { println!("{} {}", "i".cyan().bold(), msg); }
+fn print_warn(msg: &str) { println!("{} {}", "!".yellow().bold(), msg); }
+
+fn hr() -> String {
+    let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
+    let w = width.clamp(40, 120);
+    "─".repeat(w)
+}
+
+fn print_boxed(title: &str, content: &str) {
+    let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
+    if lines.is_empty() { lines.push(String::new()); }
+    let max_line = lines.iter().map(|s| s.len()).max().unwrap_or(0);
+    let title_str = format!(" {} ", title);
+    let inner_width = max_line.max(title_str.len());
+    let top = format!("┌{}┐", "─".repeat(inner_width));
+    let mid_title = format!("│{}{}│", title_str.as_str().bold(), " ".repeat(inner_width.saturating_sub(title_str.len())));
+    println!("{}", top);
+    println!("{}", mid_title);
+    println!("│{}│", " ".repeat(inner_width));
+    for l in lines {
+        let pad = inner_width.saturating_sub(l.len());
+        println!("│{}{}│", l, " ".repeat(pad));
+    }
+    println!("└{}┘", "─".repeat(inner_width));
+}
+
+// -------------------- First-run API key setup --------------------
+
+fn ensure_gemini_api_key_interactive() -> Result<()> {
+    if std::env::var("GEMINI_API_KEY").is_ok() { return Ok(()); }
+
+    print_warn("GEMINI_API_KEY not set. AI commit messages require a Google Generative Language API key.");
+    println!("Get a key: {}", "https://ai.google.dev/".underlined());
+    let input = rpassword::prompt_password("Enter GEMINI_API_KEY (hidden, or press Enter to skip): ")
+        .map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
+    let key = input.trim().to_string();
+    if key.is_empty() {
+        print_warn("No key entered. AI commit requires GEMINI_API_KEY. Exiting.");
+        return Err(anyhow::anyhow!("GEMINI_API_KEY not provided"));
+    }
+
+    // Set for current process
+    std::env::set_var("GEMINI_API_KEY", &key);
+
+    // Persist to shell RC
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let mut rc_path = std::path::PathBuf::from(&home);
+    if shell.contains("zsh") {
+        rc_path.push(".zshrc");
+    } else if shell.contains("bash") {
+        rc_path.push(".bashrc");
+    } else {
+        // Default to zshrc if unknown
+        rc_path.push(".zshrc");
+    }
+
+    let line = format!("\n# repod: AI commit setup\nexport GEMINI_API_KEY=\"{}\"\n", key);
+    match std::fs::OpenOptions::new().create(true).append(true).open(&rc_path) {
+        Ok(mut f) => {
+            use std::io::Write as _;
+            if let Err(e) = f.write_all(line.as_bytes()) {
+                print_warn(&format!("Saved key for this session, but failed to update {}: {}", rc_path.display(), e));
+            } else {
+                print_success(&format!("Saved GEMINI_API_KEY to {}", rc_path.display()));
+            }
+        }
+        Err(e) => {
+            print_warn(&format!("Saved key for this session, but failed to open {}: {}", rc_path.display(), e));
+        }
+    }
+
     Ok(())
 }
 

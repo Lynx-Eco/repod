@@ -192,7 +192,9 @@ Notes:
 
 ## AI Commit Messages
 
-When `--commit` is provided, the tool proposes a Conventional Commit message with a subject and a short body based on your current diff (against `HEAD`). It uses Google’s Gemini model `models/gemini-2.5-flash` via the Generative Language API. You’ll be shown the message and asked to confirm with a single keypress (press `y` to commit, `n`/Esc to cancel — no Enter needed).
+When `--commit` is provided, the tool proposes a Conventional Commit message with a subject and a short body based on your current diff (against `HEAD`). It uses Google’s Gemini model `models/gemini-2.5-flash` via the Generative Language API. You’ll be shown the message in a clean, boxed view and asked to confirm with a single keypress (press `y` to commit, `n`/Esc to cancel — no Enter needed).
+
+First run: If `GEMINI_API_KEY` is not set, repod prompts you to paste it (input is hidden). If provided, it saves the key to your shell config (`~/.zshrc` for zsh or `~/.bashrc` for bash) and uses it immediately for the current session. If you skip providing a key, the command exits — there is no local fallback when the API key is missing.
 
 Important: `--commit` only works when processing the current directory (no CSV or remote URL). For other inputs, the commit step is skipped.
 
@@ -211,7 +213,7 @@ Behavior:
 
 ### Multi-Commit Planning (`--multi-commit`)
 
-The tool analyzes all changes and proposes a set of smaller, logical commits. It shows a summary of each proposed commit (title, optional body, and files included), then asks you to confirm each commit one-by-one with a single keypress (`y` to apply, `n` to skip). Any remaining files can optionally be committed at the end.
+The tool analyzes all changes and proposes a set of smaller, logical commits. It shows a styled summary of each proposed commit (title, optional body, and files included), then asks you to confirm each commit one-by-one with a single keypress (`y` to apply, `n` to skip). Any remaining files can optionally be committed at the end.
 
 Notes:
 - Planning uses file-level grouping (not hunk-level).
