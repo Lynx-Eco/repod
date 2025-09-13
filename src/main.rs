@@ -1011,7 +1011,7 @@ fn commit_with_ai_message(repo_dir: &Path) -> Result<()> {
 
     // Show and confirm
     println!("Proposed commit message:\n\n{}", msg);
-    if !prompt_yes_no("Commit with this message? [y/N] ")? {
+    if !prompt_yes_no_keypress("Commit with this message? [y/N] ")? {
         println!("Commit canceled by user.");
         return Ok(());
     }
@@ -1105,7 +1105,7 @@ fn commit_with_ai_choice(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
             if !leftovers.is_empty() {
                 println!("There are leftover uncommitted files ({}).", leftovers.len());
                 for f in &leftovers { println!("  - {}", f); }
-                if prompt_yes_no("Generate AI commit for leftovers? [y/N] ")? {
+                if prompt_yes_no_keypress("Generate AI commit for leftovers? [y/N] ")? {
                     commit_files_with_ai(repo_dir, &leftovers, multi_progress)?;
                     println!("Leftover files committed.");
                 }
@@ -1121,7 +1121,7 @@ fn commit_with_ai_choice(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
             if !post_leftovers.is_empty() {
                 println!("There are leftover uncommitted files ({}).", post_leftovers.len());
                 for f in &post_leftovers { println!("  - {}", f); }
-                if prompt_yes_no("Generate AI commit for leftovers? [y/N] ")? {
+                if prompt_yes_no_keypress("Generate AI commit for leftovers? [y/N] ")? {
                     commit_files_with_ai(repo_dir, &post_leftovers, multi_progress)?;
                     println!("Leftover files committed.");
                 }
@@ -1160,7 +1160,7 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
 
     // Show message and confirm
     println!("Proposed commit message:\n\n{}\n", msg);
-    if !prompt_yes_no("Commit with this message? [y/N] ")? {
+    if !prompt_yes_no_keypress("Commit with this message? [y/N] ")? {
         println!("Commit canceled.");
         return Ok(());
     }
@@ -1182,7 +1182,7 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
     if !leftovers.is_empty() {
         println!("There are leftover uncommitted files ({}).", leftovers.len());
         for f in &leftovers { println!("  - {}", f); }
-        if prompt_yes_no("Generate AI commit for leftovers? [y/N] ")? {
+        if prompt_yes_no_keypress("Generate AI commit for leftovers? [y/N] ")? {
             commit_files_with_ai(repo_dir, &leftovers, multi_progress)?;
             println!("Leftover files committed.");
         }
@@ -1227,7 +1227,7 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Resu
         if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
         println!("Files ({}):", c.files.len());
         for f in &c.files { println!("  - {}", f); }
-        if prompt_yes_no("Commit this change? [y/N] ")? {
+        if prompt_yes_no_keypress("Commit this change? [y/N] ")? {
             let mut add_args = vec!["git".to_string(), "add".to_string(), "-A".to_string(), "--".to_string()];
             for f in &c.files { add_args.push(f.clone()); }
             run_in_repo_strings(repo_dir, add_args)?;
@@ -1248,7 +1248,7 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Resu
     if !post_leftovers.is_empty() {
         println!("There are leftover uncommitted files ({}).", post_leftovers.len());
         for f in &post_leftovers { println!("  - {}", f); }
-        if prompt_yes_no("Generate AI commit for leftovers? [y/N] ")? {
+        if prompt_yes_no_keypress("Generate AI commit for leftovers? [y/N] ")? {
             commit_files_with_ai(repo_dir, &post_leftovers, multi_progress)?;
             println!("Leftover files committed.");
         }
@@ -1279,14 +1279,31 @@ fn truncate(s: &str, max: usize) -> String {
     if s.len() <= max { s.to_string() } else { format!("{}\n…[truncated]", &s[..max]) }
 }
 
-fn prompt_yes_no(prompt: &str) -> Result<bool> {
-    use std::io::{self, Write};
+fn prompt_yes_no_keypress(prompt: &str) -> Result<bool> {
+    use std::io::Write;
     print!("{}", prompt);
-    io::stdout().flush().ok();
-    let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
-    let resp = input.trim().to_lowercase();
-    Ok(resp == "y" || resp == "yes")
+    std::io::stdout().flush().ok();
+    terminal::enable_raw_mode().map_err(|e| anyhow::anyhow!("failed to enable raw mode: {}", e))?;
+    let res = loop {
+        match read() {
+            Ok(Event::Key(key)) => match key.code {
+                KeyCode::Char(c) => {
+                    let cl = c.to_ascii_lowercase();
+                    match cl {
+                        'y' => { print!("{}\n", c); std::io::stdout().flush().ok(); break Ok(true); }
+                        'n' => { print!("{}\n", c); std::io::stdout().flush().ok(); break Ok(false); }
+                        _ => {}
+                    }
+                }
+                KeyCode::Esc => { print!("\n"); std::io::stdout().flush().ok(); break Ok(false); }
+                _ => {}
+            },
+            Ok(_) => {}
+            Err(e) => break Err(anyhow::anyhow!("failed to read key: {}", e)),
+        }
+    };
+    terminal::disable_raw_mode().ok();
+    res
 }
 
 fn prompt_choice_keypress(prompt: &str, allowed: &[char]) -> Result<char> {

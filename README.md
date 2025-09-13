@@ -192,7 +192,7 @@ Notes:
 
 ## AI Commit Messages
 
-When `--commit` is provided, the tool proposes a Conventional Commit message with a subject and a short body based on your current diff (against `HEAD`). It uses Google’s Gemini model `models/gemini-2.5-flash` via the Generative Language API and commits immediately.
+When `--commit` is provided, the tool proposes a Conventional Commit message with a subject and a short body based on your current diff (against `HEAD`). It uses Google’s Gemini model `models/gemini-2.5-flash` via the Generative Language API. You’ll be shown the message and asked to confirm with a single keypress (press `y` to commit, `n`/Esc to cancel — no Enter needed).
 
 Important: `--commit` only works when processing the current directory (no CSV or remote URL). For other inputs, the commit step is skipped.
 
@@ -207,11 +207,11 @@ Behavior:
 - If there are no changes to commit, the step is skipped.
 - The message uses Conventional Commits (e.g., `feat: add search filter`) and includes a brief body.
 - `--commit` is ignored for CSV or remote URLs; no commits are performed in those modes.
-- After committing, if there are leftover uncommitted files, you’ll be prompted to generate one more AI commit for just those files.
+ - After committing, if there are leftover uncommitted files, you’ll be prompted (single keypress `y`/`n`) to generate one more AI commit for just those files.
 
 ### Multi-Commit Planning (`--multi-commit`)
 
-The tool analyzes all changes and proposes a set of smaller, logical commits. It shows a summary of each commit (title, optional body, and files included), and prompts for confirmation. If accepted, it stages the files per commit and creates the commits in order. Any remaining files can optionally be committed at the end.
+The tool analyzes all changes and proposes a set of smaller, logical commits. It shows a summary of each proposed commit (title, optional body, and files included), then asks you to confirm each commit one-by-one with a single keypress (`y` to apply, `n` to skip). Any remaining files can optionally be committed at the end.
 
 Notes:
 - Planning uses file-level grouping (not hunk-level).
