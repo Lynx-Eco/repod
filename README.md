@@ -87,6 +87,9 @@ repod --commit
 # Ask a question about the current repository (uses Gemini 2.5 Pro)
 repod --ask "What are the main components and how do they interact?"
 
+# Ask about a remote repository (HTTPS or SSH URL)
+repod https://github.com/username/repo --ask "Summarize architecture and key modules"
+
 # Commit to a specific branch (creates/switches if needed)
 repod --commit=feature/my-branch
 

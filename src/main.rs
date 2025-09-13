@@ -323,16 +323,44 @@ fn main() -> Result<()> {
     let stats = Arc::new(Mutex::new(ProcessingStats::default()));
     let multi_progress = Arc::new(MultiProgress::new());
 
-    // Handle --ask (question about current repo) before other flows
+    // Handle --ask (question about repo) before other flows
     if let Some(question) = &args.ask {
-        if args.input.as_deref().unwrap_or(".") != "." {
-            println!("--ask only works on the current directory. Skipping.");
-        } else {
-            ensure_gemini_api_key_interactive()?;
-            let multi_progress = Arc::new(MultiProgress::new());
-            ask_about_repository(&std::env::current_dir()?, question, &args, &multi_progress)?;
-            return Ok(());
-        }
+        ensure_gemini_api_key_interactive()?;
+        let multi_progress = Arc::new(MultiProgress::new());
+
+        // Resolve target directory:
+        // - No input or "." => current dir
+        // - HTTPS/SSH URL => clone to temp dir
+        // - CSV => not supported
+        // - Local path => use it if exists
+        let mut _tmp: Option<TempDir> = None;
+        let repo_dir: PathBuf = match args.input.as_deref() {
+            None | Some(".") => std::env::current_dir()?,
+            Some(inp) if inp.ends_with(".csv") => {
+                print_warn("--ask does not support CSV inputs; use a single repo or the current directory.");
+                return Ok(());
+            }
+            Some(inp) if inp.starts_with("https://") || inp.starts_with("git@") => {
+                let tmp = TempDir::new()?;
+                let path = tmp.path().to_path_buf();
+                // Clone with progress bars
+                let _repo = clone_repository(inp, &path, &args, &multi_progress)
+                    .with_context(|| format!("Failed to access repository: {}", inp))?;
+                _tmp = Some(tmp);
+                path
+            }
+            Some(local) => {
+                let p = PathBuf::from(local);
+                if !p.exists() {
+                    print_warn(&format!("Path not found: {}", local));
+                    return Ok(());
+                }
+                p
+            }
+        };
+
+        ask_about_repository(&repo_dir, question, &args, &multi_progress)?;
+        return Ok(());
     }
 
     // Determine if commit is allowed (only for current directory runs)
@@ -1109,6 +1137,17 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_
         println!("Files ({}):", c.files.len());
         for f in &c.files { println!("  - {}", f); }
         println!("");
+
+        // Per-commit change summary (shortstat + numstat scoped to these files)
+        let mut shortstat_args = vec!["git".to_string(), "diff".to_string(), "--shortstat".to_string(), "HEAD".to_string(), "--".to_string()];
+        let mut numstat_args = vec!["git".to_string(), "diff".to_string(), "--numstat".to_string(), "HEAD".to_string(), "--".to_string()];
+        for f in &c.files { shortstat_args.push(f.clone()); numstat_args.push(f.clone()); }
+        if let Ok(shortstat_scoped) = run_in_repo_strings(repo_dir, shortstat_args) {
+            if let Ok(numstat_scoped) = run_in_repo_strings(repo_dir, numstat_args) {
+                let box_text = build_changes_summary_box(&numstat_scoped, &shortstat_scoped, 50);
+                if !box_text.trim().is_empty() { print_boxed("Changes", &box_text); }
+            }
+        }
     }
     if !leftovers.is_empty() {
         print_warn(&format!("Leftover files not in any commit: {}", leftovers.len()));
