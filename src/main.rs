@@ -1033,6 +1033,9 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress, branch
     pb.set_message("Generating single-commit proposal...");
     let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
     let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
+    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", "HEAD"])?;
+    let changes_box = build_changes_summary_box(&numstat, &shortstat, 50);
+    print_boxed("Changes", &changes_box);
     let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])? , 20_000);
     let prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
     let msg = match generate_commit_message_via_gemini(&prompt) {
@@ -1093,6 +1096,10 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("Analyzing multi-commit plan...");
     let (commits, leftovers) = plan_multi_commits(repo_dir, multi_progress)?;
+    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
+    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", "HEAD"])?;
+    let changes_box = build_changes_summary_box(&numstat, &shortstat, 50);
+    print_boxed("Changes", &changes_box);
     pb.finish_with_message(format!("{}", "Multi-commit analysis complete".to_string().green().bold()));
 
     println!("Proposed multi-commit plan:\n");
@@ -1889,6 +1896,32 @@ fn strip_ansi(s: &str) -> String {
             continue;
         }
         out.push(b as char);
+    }
+    out
+}
+
+fn build_changes_summary_box(numstat: &str, shortstat: &str, max_rows: usize) -> String {
+    let mut out = String::new();
+    let mut rows = Vec::new();
+    for (i, line) in numstat.lines().enumerate() {
+        if i >= max_rows { break; }
+        // format: added\tdeleted\tpath
+        let parts: Vec<&str> = line.split('\t').collect();
+        if parts.len() >= 3 {
+            let added = parts[0];
+            let deleted = parts[1];
+            let path = parts[2];
+            rows.push(format!("+{:>6}  -{:>6}  {}", added, deleted, path));
+        }
+    }
+    out.push_str(shortstat.trim());
+    out.push('\n');
+    if !rows.is_empty() {
+        out.push_str("\n");
+        for r in rows { out.push_str(&r); out.push('\n'); }
+        if numstat.lines().count() > max_rows {
+            out.push_str(&format!("… and {} more files\n", numstat.lines().count() - max_rows));
+        }
     }
     out
 }
