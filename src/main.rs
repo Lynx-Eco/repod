@@ -221,10 +221,22 @@ struct Args {
     #[arg(long)]
     commit: bool,
 
-    /// Analyze changes and propose multiple commits (current directory only)
+    /// Analyze changes and propose multiple commits (per-commit confirmations)
     /// Uses Gemini (models/gemini-2.5-flash) via GEMINI_API_KEY
     #[arg(long = "multi-commit")]
     multi_commit: bool,
+
+    /// Target branch: name or 'auto' to propose a name from changes
+    #[arg(long)]
+    branch: Option<String>,
+
+    /// After committing, push the current branch to origin (sets upstream if needed)
+    #[arg(long)]
+    push: bool,
+
+    /// Ask a question about the current repository (--ask "question about repo")
+    #[arg(long)]
+    ask: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,6 +322,18 @@ fn main() -> Result<()> {
 
     let stats = Arc::new(Mutex::new(ProcessingStats::default()));
     let multi_progress = Arc::new(MultiProgress::new());
+
+    // Handle --ask (question about current repo) before other flows
+    if let Some(question) = &args.ask {
+        if args.input.as_deref().unwrap_or(".") != "." {
+            println!("--ask only works on the current directory. Skipping.");
+        } else {
+            ensure_gemini_api_key_interactive()?;
+            let multi_progress = Arc::new(MultiProgress::new());
+            ask_about_repository(&std::env::current_dir()?, question, &args, &multi_progress)?;
+            return Ok(());
+        }
+    }
 
     // Determine if commit is allowed (only for current directory runs)
     let wants_commit = args.commit || args.multi_commit;
@@ -694,10 +718,12 @@ fn process_repository(
     if allow_commit {
         // On first use of commit features, ensure GEMINI_API_KEY is configured
         ensure_gemini_api_key_interactive()?;
-        if args.multi_commit {
-            commit_with_ai_multi(&repo_dir, &multi_progress)?;
+        if args.multi_commit && args.commit {
+            print_warn("Both --commit and --multi-commit provided; choose one. Skipping commit.");
+        } else if args.multi_commit {
+            commit_with_ai_multi(&repo_dir, &multi_progress, args.branch.as_deref(), args.push)?;
         } else if args.commit {
-            commit_with_ai_single(&repo_dir, &multi_progress)?;
+            commit_with_ai_single(&repo_dir, &multi_progress, args.branch.as_deref(), args.push)?;
         }
         return Ok(());
     }
@@ -986,162 +1012,15 @@ fn process_repository(
 
 // -------------------- Commit support --------------------
 
-fn commit_with_ai_message(repo_dir: &Path) -> Result<()> {
-    // Ensure we're in a git repository
-    if !repo_dir.join(".git").exists() {
-        anyhow::bail!("Not a git repository: {}", repo_dir.display());
-    }
+// (old commit_with_ai_message/commit_with_ai_choice removed)
 
-    // Detect any changes (staged or unstaged)
-    let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
-    if status_porcelain.trim().is_empty() {
-        println!("No changes detected. Nothing to commit.");
-        return Ok(());
-    }
-
-    // Build prompt from diff vs HEAD (includes both staged and unstaged)
-    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
-    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
-    // Keep the diff small to avoid huge payloads; include a bit of context
-    let diff_sample = run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])?;
-    let diff_sample = truncate(&diff_sample, 10_000);
-
-    let prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
-    let msg = match generate_commit_message_via_gemini(&prompt) {
-        Ok(m) => m,
-        Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
-    };
-
-    // Show and confirm
-    println!("Proposed commit message:\n\n{}", msg);
-    if !prompt_yes_no_keypress("Commit with this message? [y/N] ")? {
-        println!("Commit canceled by user.");
-        return Ok(());
-    }
-
-    // Stage all changes and commit
-    run_in_repo(repo_dir, &["git", "add", "-A"])?.to_string();
-    let commit_res = run_in_repo(repo_dir, &["git", "commit", "-m", &msg]);
-    match commit_res {
-        Ok(_) => { println!("Committed with AI message: {}", msg); Ok(()) }
-        Err(e) => Err(e),
-    }
-}
-
-fn commit_with_ai_choice(repo_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
-    // Ensure repo and changes
-    if !repo_dir.join(".git").exists() {
-        anyhow::bail!("Not a git repository: {}", repo_dir.display());
-    }
-    let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
-    if status_porcelain.trim().is_empty() {
-        anyhow::bail!("no changes to commit");
-    }
-
-    // Produce single-commit proposal (multi-line)
-    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
-    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
-    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])? , 20_000);
-    let pb_single = multi_progress.add(ProgressBar::new_spinner());
-    pb_single.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
-    pb_single.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb_single.set_message("Generating single-commit proposal...");
-    let single_prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
-    let single_msg = match generate_commit_message_via_gemini(&single_prompt) {
-        Ok(m) => m,
-        Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
-    };
-    pb_single.finish_with_message("Single-commit proposal ready");
-
-    // Try to produce multi-commit plan
-    let pb_multi = multi_progress.add(ProgressBar::new_spinner());
-    pb_multi.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
-    pb_multi.enable_steady_tick(std::time::Duration::from_millis(100));
-    pb_multi.set_message("Analyzing multi-commit plan...");
-    let multi_plan = plan_multi_commits(repo_dir, multi_progress).ok();
-    pb_multi.finish_with_message("Multi-commit analysis complete");
-    let has_sensible_multi = multi_plan
-        .as_ref()
-        .map(|(commits, _)| commits.len() >= 2)
-        .unwrap_or(false);
-
-    // Show options
-    println!("Option A: Single commit message:\n\n{}\n", single_msg);
-    if has_sensible_multi {
-        let (commits, leftovers) = multi_plan.as_ref().unwrap();
-        println!("Option B: Multi-commit plan ({} commits):\n", commits.len());
-        for (i, c) in commits.iter().enumerate() {
-            println!("{}. {}", i + 1, c.title);
-            if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
-            println!("Files ({}):", c.files.len());
-            for f in &c.files { println!("  - {}", f); }
-            println!("");
-        }
-        if !leftovers.is_empty() {
-            println!("Leftover files not in any commit ({}):", leftovers.len());
-            for f in leftovers { println!("  - {}", f); }
-            println!("");
-        }
-    } else {
-        println!("No sensible multi-commit split proposed (showing single commit only).\n");
-    }
-
-    // Choose
-    let choice = prompt_choice_keypress(if has_sensible_multi { "Choose [a] single, [b] multi, or [c] cancel: " } else { "Choose [a] single or [c] cancel: " }, if has_sensible_multi { &['a','b','c'] } else { &['a','c'] })?;
-    match choice {
-        'a' => {
-            // Directly commit without extra confirmation
-            run_in_repo(repo_dir, &["git", "add", "-A"])?;
-            if let Some((subject, body)) = split_subject_body(&single_msg) {
-                if body.trim().is_empty() {
-                    run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim()])?;
-                } else {
-                    run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim(), "-m", body.trim()])?;
-                }
-            } else {
-                run_in_repo(repo_dir, &["git", "commit", "-m", single_msg.trim()])?;
-            }
-            println!("Committed with AI message.");
-
-            // Check for leftover changes and offer AI commit
-            let leftovers = list_changed_files_vs_head(repo_dir)?;
-            if !leftovers.is_empty() {
-                println!("There are leftover uncommitted files ({}).", leftovers.len());
-                for f in &leftovers { println!("  - {}", f); }
-                if prompt_yes_no_keypress("Generate AI commit for leftovers? [y/N] ")? {
-                    commit_files_with_ai(repo_dir, &leftovers, multi_progress)?;
-                    println!("Leftover files committed.");
-                }
-            }
-            Ok(())
-        }
-        'b' if has_sensible_multi => {
-            let (commits, leftovers) = multi_plan.unwrap();
-            // Directly execute multi-commit plan
-            do_commits(repo_dir, &commits, &leftovers)?;
-            // After executing plan, if leftovers remain (e.g., files added during run), offer AI commit
-            let post_leftovers = if leftovers.is_empty() { list_changed_files_vs_head(repo_dir)? } else { leftovers.clone() };
-            if !post_leftovers.is_empty() {
-                println!("There are leftover uncommitted files ({}).", post_leftovers.len());
-                for f in &post_leftovers { println!("  - {}", f); }
-                if prompt_yes_no_keypress("Generate AI commit for leftovers? [y/N] ")? {
-                    commit_files_with_ai(repo_dir, &post_leftovers, multi_progress)?;
-                    println!("Leftover files committed.");
-                }
-            }
-            println!("Multi-commit completed.");
-            Ok(())
-        }
-        _ => { println!("Canceled."); Ok(()) }
-    }
-}
-
-fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
-    print_title("AI Commit (Single)");
+fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress, branch_spec: Option<&str>, do_push: bool) -> Result<()> {
     if !repo_dir.join(".git").exists() {
         print_warn(&format!("Not a git repository: {}", repo_dir.display()));
         return Ok(());
     }
+    let current_branch = ensure_on_target_branch(repo_dir, branch_spec, multi_progress)?;
+    print_title(&format!("AI Commit (Single) — branch: {}", current_branch));
     let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
     if status_porcelain.trim().is_empty() {
         print_info("No changes detected. Nothing to commit.");
@@ -1180,7 +1059,9 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
     } else {
         run_in_repo(repo_dir, &["git", "commit", "-m", msg.trim()])?;
     }
-    print_success("Committed.");
+    print_success(&format!("Committed to {}.", current_branch));
+
+    if do_push { try_push(repo_dir, &current_branch)?; }
 
     let leftovers = list_changed_files_vs_head(repo_dir)?;
     if !leftovers.is_empty() {
@@ -1194,12 +1075,13 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress) -> Res
     Ok(())
 }
 
-fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Result<()> {
-    print_title("AI Commit (Multi)");
+fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_spec: Option<&str>, do_push: bool) -> Result<()> {
     if !repo_dir.join(".git").exists() {
         print_warn(&format!("Not a git repository: {}", repo_dir.display()));
         return Ok(());
     }
+    let current_branch = ensure_on_target_branch(repo_dir, branch_spec, multi_progress)?;
+    print_title(&format!("AI Commit (Multi) — branch: {}", current_branch));
     let status_porcelain = run_in_repo(repo_dir, &["git", "status", "--porcelain"])?;
     if status_porcelain.trim().is_empty() {
         print_info("No changes detected. Nothing to commit.");
@@ -1258,6 +1140,7 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress) -> Resu
             print_success("Leftover files committed.");
         }
     }
+    if do_push { try_push(repo_dir, &current_branch)?; }
     print_success("Multi-commit completed.");
     Ok(())
 }
@@ -1345,6 +1228,15 @@ fn split_subject_body(msg: &str) -> Option<(String, String)> {
     let subject = lines.next()?.to_string();
     let rest: String = lines.collect::<Vec<&str>>().join("\n");
     Some((subject, rest))
+}
+
+fn read_line_prompt(prompt: &str) -> Result<String> {
+    use std::io::{self, Write};
+    print!("{}", prompt);
+    io::stdout().flush().ok();
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
+    Ok(input.trim().to_string())
 }
 
 fn build_commit_prompt_multiline(name_status: &str, shortstat: &str, diff_sample: &str) -> String {
@@ -1510,26 +1402,7 @@ fn plan_multi_commits(repo_dir: &Path, _multi_progress: &MultiProgress) -> Resul
     Ok((normalized, leftovers))
 }
 
-fn do_commits(repo_dir: &Path, commits: &Vec<CommitPlan>, _leftovers: &Vec<String>) -> Result<()> {
-    // Execute commits in order
-    for c in commits {
-        let mut args = vec!["git", "add", "-A", "--"]; // stage specific files
-        for f in &c.files { args.push(f); }
-        run_in_repo(repo_dir, &args)?;
-
-        let subject = c.title.trim();
-        let body = c.body.as_deref().unwrap_or("").trim();
-        let commit_res = if body.is_empty() {
-            run_in_repo(repo_dir, &["git", "commit", "-m", subject])
-        } else {
-            run_in_repo(repo_dir, &["git", "commit", "-m", subject, "-m", body])
-        };
-        if let Err(e) = commit_res { return Err(e); }
-    }
-
-    // Leave handling of leftovers to the caller (they may choose AI commit)
-    Ok(())
-}
+// (old do_commits removed)
 
 fn build_multi_commit_prompt(name_status: &str, numstat: &str, shortstat: &str, diff_sample: &str) -> String {
     format!(
@@ -1578,6 +1451,278 @@ fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
     let plan: CommitPlanResponse = serde_json::from_str(text.trim())
         .map_err(|e| anyhow::anyhow!("failed to parse plan JSON: {}", e))?;
     Ok(plan)
+}
+
+// -------------------- Ask repo (Q&A) --------------------
+
+fn ask_about_repository(repo_dir: &Path, question: &str, args: &Args, multi_progress: &MultiProgress) -> Result<()> {
+    print_title("Ask (Repository)");
+
+    // Build repository dump (tree + selected files)
+    let pb = multi_progress.add(ProgressBar::new_spinner());
+    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb.enable_steady_tick(std::time::Duration::from_millis(100));
+    pb.set_message("Preparing repository context...");
+    let t0 = Instant::now();
+    let (dump, stats) = build_repo_dump(repo_dir, args)?;
+    pb.finish_with_message(format!("{}", "Repository context ready".to_string().green().bold()));
+    print_info(&format!("Included files: {} | Context bytes: {}", stats.files, stats.bytes));
+
+    // Copy to clipboard for convenience
+    if let Ok(mut ctx) = ClipboardContext::new() { let _ = ctx.set_contents(dump.clone()); }
+
+    // Build full prompt for token count
+    let prompt_preview = format!(
+        "You are assisting with repository analysis.\n\
+        Answer the user's question based on the repository content.\n\
+        Be concise and specific; include filenames when relevant.\n\
+        Question:\n{}\n\
+        Repository:\n{}",
+        question.trim(), dump
+    );
+    let tokenizer = o200k_base().unwrap();
+    let token_count = tokenizer.encode_with_special_tokens(&prompt_preview).len();
+    if token_count > 1_000_000 {
+        print_warn(&format!(
+            "Context too large ({} tokens > 1,000,000). Aborting request.\nHint: Narrow with --only/--exclude or reduce repository size.",
+            token_count
+        ));
+        return Ok(());
+    }
+    print_info(&format!("Prompt tokens: {} | Prep time: {:.2}s", token_count, t0.elapsed().as_secs_f64()));
+
+    print_title("Answer (streaming)");
+    if let Err(e) = generate_repo_answer_stream_via_gemini(question, &dump) {
+        print_warn(&format!("Streaming failed ({}). Falling back to non-streaming.", e));
+        let answer = generate_repo_answer_via_gemini(question, &dump)?;
+        print_boxed("Answer", &answer);
+    }
+    Ok(())
+}
+
+struct AskStats { files: usize, bytes: usize }
+
+fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
+    // Build combined excluded patterns
+    let excluded_patterns: Vec<&str> = EXCLUDED_PATTERNS.iter()
+        .copied()
+        .chain(args.exclude.iter().map(|s| s.as_str()))
+        .collect();
+
+    // Tree first
+    let mut output = String::new();
+    let mut files_included = 0usize;
+    output.push_str("<directory_structure>\n");
+    let tree = DirectoryTree::build(repo_dir, &excluded_patterns, &args.only)?;
+    output.push_str(&tree.format());
+    output.push_str("\n</directory_structure>\n\n");
+
+    // README first if exists
+    let readme_names = ["README.md", "README.txt", "README", "Readme.md", "readme.md"]; 
+    for readme_name in readme_names {
+        let readme_path = repo_dir.join(readme_name);
+        if readme_path.exists() && readme_path.is_file() {
+            if !args.only.is_empty() {
+                let matches = args.only.iter().any(|pattern| Pattern::new(pattern).map(|p| p.matches(readme_name)).unwrap_or(false));
+                if !matches { continue; }
+            }
+            if let Ok(content) = read_file_content(&readme_path) {
+                output.push_str("<file_info>\n");
+                output.push_str(&format!("path: {}\n", readme_name));
+                output.push_str(&format!("name: {}\n", readme_name));
+                output.push_str("</file_info>\n");
+                output.push_str(&content);
+                output.push_str("\n\n");
+                files_included += 1;
+            }
+            break;
+        }
+    }
+
+    // Walk and include other files
+    let mut walker_builder = WalkBuilder::new(repo_dir);
+    walker_builder
+        .hidden(false)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .ignore(true)
+        .parents(true);
+
+    for result in walker_builder.build().filter_map(Result::ok) {
+        let path = result.path();
+        if path == repo_dir { continue; }
+        let path_str = path.to_string_lossy();
+        // Exclusions
+        if excluded_patterns.iter().any(|p| path_str.contains(p)) {
+            continue;
+        }
+        // Hidden components
+        if let Ok(rel) = path.strip_prefix(repo_dir) {
+            let hidden = rel.components().any(|c| matches!(c, std::path::Component::Normal(n) if n.to_string_lossy().starts_with('.')));
+            if hidden { continue; }
+        }
+        let is_file = result.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+        if !is_file { continue; }
+
+        // Respect --only patterns and repo_types
+        if !should_process_file(path, if args.repo_types.is_empty() { None } else { Some(&args.repo_types) }, &args.only) {
+            continue;
+        }
+        if matches!(is_binary_file(path), Ok(true)) { continue; }
+
+        if let Ok(content) = read_file_content(path) {
+            let rel = path.strip_prefix(repo_dir).unwrap().display().to_string();
+            output.push_str("<file_info>\n");
+            output.push_str(&format!("path: {}\n", &rel));
+            output.push_str(&format!("name: {}\n", std::path::Path::new(&rel).file_name().unwrap().to_string_lossy()));
+            output.push_str("</file_info>\n");
+            output.push_str(&content);
+            output.push_str("\n\n");
+            files_included += 1;
+        }
+    }
+
+    let bytes = output.len();
+    Ok((output, AskStats { files: files_included, bytes }))
+}
+
+fn generate_repo_answer_via_gemini(question: &str, repo_dump: &str) -> Result<String> {
+    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    let model = "gemini-2.5-pro";
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
+        model, api_key
+    );
+
+    let prompt = format!(
+        "You are assisting with repository analysis.\n\
+        Answer the user's question based on the repository content.\n\
+        Be concise and specific; include filenames when relevant.\n\
+        Question:\n{}\n\
+        Repository:\n{}",
+        question.trim(), repo_dump
+    );
+
+    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: &prompt }] }] };
+    let resp: GeminiResponse = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .send_json(serde_json::to_value(&req)?)
+        .map_err(|e| anyhow::anyhow!("Gemini request failed: {}", e))?
+        .into_json()
+        .map_err(|e| anyhow::anyhow!("invalid Gemini JSON: {}", e))?;
+
+    let text = resp
+        .candidates
+        .and_then(|mut v| v.pop())
+        .and_then(|c| c.content)
+        .and_then(|c| c.parts)
+        .and_then(|mut parts| parts.pop())
+        .and_then(|p| p.text)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if text.is_empty() { anyhow::bail!("empty response from model") } else { Ok(text) }
+}
+
+fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Result<()> {
+    use std::io::{BufRead, BufReader};
+    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    let model = "gemini-2.5-pro";
+    let url = format!(
+        "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
+        model, api_key
+    );
+
+    let prompt = format!(
+        "You are assisting with repository analysis.\n\
+        Answer the user's question based on the repository content.\n\
+        Be concise and specific; include filenames when relevant.\n\
+        Question:\n{}\n\
+        Repository:\n{}",
+        question.trim(), repo_dump
+    );
+
+    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: &prompt }] }] };
+    let resp = ureq::post(&url)
+        .set("Content-Type", "application/json")
+        .set("Accept", "text/event-stream")
+        .send_json(serde_json::to_value(&req)?)
+        .map_err(|e| anyhow::anyhow!("Gemini stream request failed: {}", e))?;
+
+    let mut reader = BufReader::new(resp.into_reader());
+    let inner = stream_box_start("Answer");
+    let mut text_buf = String::new();
+    let mut sse_event = String::new();
+    let mut line = String::new();
+    let mut streamed_any = false;
+    let mut last_usage: Option<serde_json::Value> = None;
+
+    while reader.read_line(&mut line)? > 0 {
+        let l = line.trim_end().to_string();
+        line.clear();
+        // SSE events end with a blank line
+        if l.is_empty() {
+            if sse_event.is_empty() { continue; }
+            // Remove possible 'data: ' prefix occurrences (one per line)
+            let data = sse_event
+                .lines()
+                .filter_map(|ln| ln.strip_prefix("data:").map(|rest| rest.trim()))
+                .collect::<Vec<_>>()
+                .join("");
+            sse_event.clear();
+
+            if data.is_empty() { continue; }
+            if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
+                // Extract any text
+                let mut appended = false;
+                if let Some(cands) = v.get("candidates").and_then(|c| c.as_array()) {
+                    for cand in cands {
+                        if let Some(content) = cand.get("content") {
+                            if let Some(parts) = content.get("parts").and_then(|p| p.as_array()) {
+                                for part in parts {
+                                    if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
+                                        text_buf.push_str(t);
+                                        appended = true;
+                                    }
+                                }
+                            }
+                        }
+                        if let Some(delta) = cand.get("delta") {
+                            if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
+                                text_buf.push_str(t);
+                                appended = true;
+                            }
+                        }
+                    }
+                }
+                // Capture usage metadata if present
+                if v.get("usageMetadata").is_some() { last_usage = Some(v.clone()); }
+
+                if appended {
+                    streamed_any = true;
+                    while let Some(pos) = text_buf.find('\n') {
+                        let line_text = text_buf[..pos].to_string();
+                        stream_box_line(inner, &line_text);
+                        text_buf.drain(..=pos);
+                    }
+                }
+            }
+            continue;
+        }
+        // accumulate event lines
+        sse_event.push_str(&l);
+        sse_event.push('\n');
+    }
+    if !text_buf.is_empty() { stream_box_line(inner, &text_buf); }
+    stream_box_end(inner);
+    if let Some(u) = last_usage {
+        if let Some(total) = u.get("usageMetadata").and_then(|m| m.get("totalTokenCount")).and_then(|x| x.as_i64()) {
+            print_info(&format!("Total tokens used: {}", total));
+        }
+    }
+    if !streamed_any { return Err(anyhow::anyhow!("no streamed content")); }
+    Ok(())
 }
 
 // -------- Leftover helpers --------
@@ -1690,6 +1835,64 @@ fn print_boxed(title: &str, content: &str) {
     println!("└{}┘", "─".repeat(inner_width));
 }
 
+// Streaming box helpers
+fn stream_box_start(title: &str) -> usize {
+    let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80).clamp(40, 120);
+    let inner = width;
+    println!("┌{}┐", "─".repeat(inner));
+    let title_str = format!(" {} ", title).bold();
+    let pad = inner.saturating_sub(strip_ansi_len(&title_str.to_string()));
+    println!("│{}{}│", title_str, " ".repeat(pad));
+    println!("│{}│", " ".repeat(inner));
+    inner
+}
+
+fn stream_box_line(inner: usize, line: &str) {
+    if line.len() <= inner {
+        let pad = inner.saturating_sub(line.len());
+        println!("│{}{}│", line, " ".repeat(pad));
+        return;
+    }
+    // Soft-wrap long lines to the box width based on character count
+    let mut start = 0usize;
+    let bytes = line.as_bytes();
+    while start < bytes.len() {
+        // Find end index for this chunk without splitting UTF-8 characters
+        let mut end = (start + inner).min(bytes.len());
+        // Move end back to a char boundary
+        while end > start && (bytes[end - 1] & 0b1100_0000) == 0b1000_0000 { end -= 1; }
+        if end == start { end = (start + inner).min(bytes.len()); }
+        let chunk = &line[start..end];
+        let pad = inner.saturating_sub(chunk.len());
+        println!("│{}{}│", chunk, " ".repeat(pad));
+        start = end;
+    }
+}
+
+fn stream_box_end(inner: usize) {
+    println!("└{}┘", "─".repeat(inner));
+}
+
+// Helper to approximate visible length ignoring simple ANSI sequences used by Stylize
+fn strip_ansi_len(s: &str) -> usize { strip_ansi(s).len() }
+fn strip_ansi(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut bytes = s.as_bytes().iter().cloned();
+    let mut in_esc = false;
+    while let Some(b) = bytes.next() {
+        if in_esc {
+            if b == b'm' { in_esc = false; }
+            continue;
+        }
+        if b == 0x1B { // ESC
+            in_esc = true;
+            continue;
+        }
+        out.push(b as char);
+    }
+    out
+}
+
 // -------------------- First-run API key setup --------------------
 
 fn ensure_gemini_api_key_interactive() -> Result<()> {
@@ -1737,6 +1940,114 @@ fn ensure_gemini_api_key_interactive() -> Result<()> {
     }
 
     Ok(())
+}
+
+// -------------------- Branch helpers --------------------
+
+fn ensure_on_target_branch(repo_dir: &Path, branch_spec: Option<&str>, multi_progress: &MultiProgress) -> Result<String> {
+    let current = get_current_branch(repo_dir)?;
+    match branch_spec.map(|s| s.trim()) {
+        None => Ok(current),
+        Some(".") | Some("auto") => {
+            // Generate a branch name
+            let pb = multi_progress.add(ProgressBar::new_spinner());
+            pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+            pb.enable_steady_tick(std::time::Duration::from_millis(100));
+            pb.set_message("Generating branch name...");
+            let suggested = generate_branch_name(repo_dir)
+                .or_else(|_| heuristic_branch_name(repo_dir))
+                .unwrap_or_else(|_| default_branch_name());
+            pb.finish_with_message(format!("Proposed branch: {}", suggested));
+            println!("");
+            let choice = prompt_choice_keypress("› Create branch? [y=accept, e=edit, n=stay]: ", &['y','e','n'])?;
+            match choice {
+                'y' => { switch_to_branch(repo_dir, &suggested, true)?; Ok(suggested) }
+                'e' => {
+                    let edited = read_line_prompt(&format!("Enter branch name [{}]: ", suggested))?;
+                    let name = if edited.trim().is_empty() { suggested } else { sanitize_branch_name(&edited) };
+                    switch_to_branch(repo_dir, &name, true)?;
+                    Ok(name)
+                }
+                _ => { print_info("Staying on current branch."); Ok(current) }
+            }
+        }
+        Some(target) => {
+            if target == current { return Ok(current); }
+            // If target exists, switch; else create
+            let exists = run_in_repo(repo_dir, &["git", "rev-parse", "--verify", target]).is_ok();
+            switch_to_branch(repo_dir, target, !exists)?;
+            Ok(target.to_string())
+        }
+    }
+}
+
+fn get_current_branch(repo_dir: &Path) -> Result<String> {
+    let name = run_in_repo(repo_dir, &["git", "rev-parse", "--abbrev-ref", "HEAD"])?;
+    Ok(name.trim().to_string())
+}
+
+fn switch_to_branch(repo_dir: &Path, name: &str, create: bool) -> Result<()> {
+    // Stash if dirty
+    let dirty = !run_in_repo(repo_dir, &["git", "status", "--porcelain"])?.trim().is_empty();
+    let mut stashed = false;
+    if dirty {
+        run_in_repo(repo_dir, &["git", "stash", "-u", "-q"])?;
+        stashed = true;
+    }
+    let res = if create { run_in_repo(repo_dir, &["git", "checkout", "-b", name]) } else { run_in_repo(repo_dir, &["git", "checkout", name]) };
+    if let Err(e) = res { return Err(e); }
+    if stashed {
+        // Try to restore
+        let _ = run_in_repo(repo_dir, &["git", "stash", "pop", "-q"]);
+    }
+    print_success(&format!("On branch {}", name));
+    Ok(())
+}
+
+fn try_push(repo_dir: &Path, branch: &str) -> Result<()> {
+    print_info(&format!("Pushing branch '{}' to origin...", branch));
+    let res = run_in_repo(repo_dir, &["git", "push", "-u", "origin", branch]);
+    match res {
+        Ok(out) => { println!("{}", out); print_success("Push complete."); Ok(()) }
+        Err(e) => { print_warn(&format!("Push failed: {}", e)); Ok(()) }
+    }
+}
+
+fn generate_branch_name(repo_dir: &Path) -> Result<String> {
+    // Use diff to propose a branch name via Gemini
+    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-only", "HEAD"])?;
+    let summary = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
+    let prompt = format!(
+        "Propose a short git branch name based on these changes.\n\
+        Rules: lowercase, words separated by '-', prefix with a conventional type (feat|fix|chore|refactor|docs|test|perf), optional scope in words, max 48 chars total, no spaces, only [a-z0-9-].\n\
+        Output ONLY the branch name.\n\
+        Files:\n{}\n\
+        Summary: {}",
+        name_status.trim(), summary.trim()
+    );
+    let text = generate_commit_message_via_gemini(&prompt)?;
+    Ok(sanitize_branch_name(&text))
+}
+
+fn heuristic_branch_name(repo_dir: &Path) -> Result<String> {
+    let files = run_in_repo(repo_dir, &["git", "diff", "--name-only", "HEAD"])?;
+    let first = files.lines().find(|l| !l.trim().is_empty()).unwrap_or("changes");
+    let scope = first.split('/').next().unwrap_or("changes");
+    let date = chrono::Local::now().format("%Y%m%d");
+    let base = format!("feat-{}-{}", scope, date);
+    Ok(sanitize_branch_name(&base))
+}
+
+fn default_branch_name() -> String {
+    let date = chrono::Local::now().format("%Y%m%d");
+    format!("feat-changes-{}", date)
+}
+
+fn sanitize_branch_name(s: &str) -> String {
+    let mut out = s.trim().to_lowercase();
+    out = out.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '/' { c } else { '-' }).collect();
+    while out.contains("--") { out = out.replace("--", "-"); }
+    out.trim_matches('-').chars().take(48).collect()
 }
 
 fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {

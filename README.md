@@ -84,6 +84,15 @@ repod git@github.com:username/repo.git --open-cursor
 # Note: --commit only works on the current directory
 repod --commit
 
+# Ask a question about the current repository (uses Gemini 2.5 Pro)
+repod --ask "What are the main components and how do they interact?"
+
+# Commit to a specific branch (creates/switches if needed)
+repod --commit=feature/my-branch
+
+# Let repod propose a branch name from changes (confirm or edit before creating)
+repod --commit=auto
+
 # Propose and apply multiple commits (current directory only)
 repod --multi-commit
 
@@ -120,8 +129,11 @@ Options:
       --at <AT>                  Specific path to clone the repository to
       --copy                     Copy output to clipboard (explicit)
       --write                    Write output to file (overrides default copy behavior)
-      --commit                   Single AI-generated commit (uses GEMINI_API_KEY; current directory only)
-      --multi-commit             AI-proposed multi-commit plan (interactive; uses GEMINI_API_KEY; current directory only)
+      --commit                   Single AI-generated commit (current dir only)
+      --multi-commit            AI-proposed multi-commit plan (current dir only)
+      --branch <BRANCH>         Target branch: name or 'auto' to propose one
+      --push                     After committing, push the current branch to 'origin' (sets upstream if needed)
+      --ask <QUESTION>           Ask a question about the current repository (uses Gemini 2.5 Pro)
   -h, --help                     Print help
   -V, --version                  Print version
 ```
@@ -195,6 +207,29 @@ Notes:
 When `--commit` is provided, the tool proposes a Conventional Commit message with a subject and a short body based on your current diff (against `HEAD`). It uses Google’s Gemini model `models/gemini-2.5-flash` via the Generative Language API. You’ll be shown the message in a clean, boxed view and asked to confirm with a single keypress (press `y` to commit, `n`/Esc to cancel — no Enter needed).
 
 First run: If `GEMINI_API_KEY` is not set, repod prompts you to paste it (input is hidden). If provided, it saves the key to your shell config (`~/.zshrc` for zsh or `~/.bashrc` for bash) and uses it immediately for the current session. If you skip providing a key, the command exits — there is no local fallback when the API key is missing.
+
+Branch selection:
+- Without `--branch`, commits use the currently checked-out branch.
+- With `--branch <name>`, repod creates/switches to `<name>` if needed before committing.
+- With `--branch auto`, repod proposes a branch name from your changes; you can accept or edit the name before creating.
+
+UI details:
+- The banner shows the current mode and branch (e.g., `AI Commit (Single) — branch: feature/foo`).
+- Proposed commit messages are shown in a boxed view; confirm with a single keypress (`y`/`n`, no Enter).
+- For `--multi-commit`, each proposed commit is confirmed one-by-one with a single keypress.
+
+## Ask About Repository (`--ask`)
+
+Provides a repository-wide context (directory tree + selected file contents) and sends your question to `models/gemini-2.5-pro`. The tool uses your `.gitignore`, built-in exclusions, and `--only`/`--exclude` filters. On very large repos, the context may be truncated to fit model limits.
+
+Limits:
+- For safety, the combined question + context is capped at ~1,000,000 tokens (approximate). If the limit is exceeded, the request is not sent. Narrow scope with `--only`/`--exclude`.
+
+Example:
+
+```bash
+repod --ask "List the main services and where their HTTP routes are defined."
+```
 
 Important: `--commit` only works when processing the current directory (no CSV or remote URL). For other inputs, the commit step is skipped.
 
