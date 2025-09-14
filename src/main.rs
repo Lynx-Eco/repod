@@ -1514,8 +1514,7 @@ fn ask_about_repository(repo_dir: &Path, question: &str, args: &Args, multi_prog
     pb.finish_with_message(format!("{}", "Repository context ready".to_string().green().bold()));
     print_info(&format!("Included files: {} | Context bytes: {}", stats.files, stats.bytes));
 
-    // Copy to clipboard for convenience
-    if let Ok(mut ctx) = ClipboardContext::new() { let _ = ctx.set_contents(dump.clone()); }
+    // Do not copy repo dump by default; we'll copy the final answer if --copy is set
 
     // Build full prompt for token count
     let prompt_preview = format!(
@@ -1538,10 +1537,23 @@ fn ask_about_repository(repo_dir: &Path, question: &str, args: &Args, multi_prog
     print_info(&format!("Prompt tokens: {} | Prep time: {:.2}s", token_count, t0.elapsed().as_secs_f64()));
 
     print_title("Answer (streaming)");
-    if let Err(e) = generate_repo_answer_stream_via_gemini(question, &dump) {
-        print_warn(&format!("Streaming failed ({}). Falling back to non-streaming.", e));
-        let answer = generate_repo_answer_via_gemini(question, &dump)?;
-        print_boxed("Answer", &answer);
+    let stream_res = generate_repo_answer_stream_via_gemini(question, &dump);
+    match stream_res {
+        Ok(answer_text) => {
+            if args.copy {
+                if let Ok(mut ctx) = ClipboardContext::new() { let _ = ctx.set_contents(answer_text); }
+                print_success("Answer copied to clipboard.");
+            }
+        }
+        Err(e) => {
+            print_warn(&format!("Streaming failed ({}). Falling back to non-streaming.", e));
+            let answer = generate_repo_answer_via_gemini(question, &dump)?;
+            print_boxed("Answer", &answer);
+            if args.copy {
+                if let Ok(mut ctx) = ClipboardContext::new() { let _ = ctx.set_contents(answer); }
+                print_success("Answer copied to clipboard.");
+            }
+        }
     }
     Ok(())
 }
@@ -1671,7 +1683,7 @@ fn generate_repo_answer_via_gemini(question: &str, repo_dump: &str) -> Result<St
     if text.is_empty() { anyhow::bail!("empty response from model") } else { Ok(text) }
 }
 
-fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Result<()> {
+fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Result<String> {
     use std::io::{BufRead, BufReader};
     let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
     let model = "gemini-2.5-pro";
@@ -1699,6 +1711,7 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
     let mut reader = BufReader::new(resp.into_reader());
     let inner = stream_box_start("Answer");
     let mut text_buf = String::new();
+    let mut full_text = String::new();
     let mut sse_event = String::new();
     let mut line = String::new();
     let mut streamed_any = false;
@@ -1729,6 +1742,7 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
                                 for part in parts {
                                     if let Some(t) = part.get("text").and_then(|t| t.as_str()) {
                                         text_buf.push_str(t);
+                                        full_text.push_str(t);
                                         appended = true;
                                     }
                                 }
@@ -1737,6 +1751,7 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
                         if let Some(delta) = cand.get("delta") {
                             if let Some(t) = delta.get("text").and_then(|t| t.as_str()) {
                                 text_buf.push_str(t);
+                                full_text.push_str(t);
                                 appended = true;
                             }
                         }
@@ -1768,7 +1783,7 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
         }
     }
     if !streamed_any { return Err(anyhow::anyhow!("no streamed content")); }
-    Ok(())
+    Ok(full_text)
 }
 
 // -------- Leftover helpers --------

@@ -90,6 +90,9 @@ repod --ask "What are the main components and how do they interact?"
 # Ask about a remote repository (HTTPS or SSH URL)
 repod https://github.com/username/repo --ask "Summarize architecture and key modules"
 
+# Copy the model's answer from --ask to the clipboard
+repod --ask "Explain the build pipeline" --copy
+
 # Commit to a specific branch (creates/switches if needed)
 repod --commit=feature/my-branch
 
@@ -220,13 +223,14 @@ UI details:
 - The banner shows the current mode and branch (e.g., `AI Commit (Single) — branch: feature/foo`).
 - Proposed commit messages are shown in a boxed view; confirm with a single keypress (`y`/`n`, no Enter).
 - For `--multi-commit`, each proposed commit is confirmed one-by-one with a single keypress.
+- A "Changes" summary box is shown with added/deleted lines per file (from `git diff --numstat`), plus the `--shortstat` summary.
 
 ## Ask About Repository (`--ask`)
 
-Provides a repository-wide context (directory tree + selected file contents) and sends your question to `models/gemini-2.5-pro`. The tool uses your `.gitignore`, built-in exclusions, and `--only`/`--exclude` filters. On very large repos, the context may be truncated to fit model limits.
+Provides a repository-wide context (directory tree + selected file contents) and sends your question to `models/gemini-2.5-pro`. The tool uses your `.gitignore`, built-in exclusions, and `--only`/`--exclude` filters. On very large repos, the context may be truncated to fit model limits. Answers stream live in a boxed view; usage stats are printed (files included, context bytes, prompt tokens, prep time).
 
 Limits:
-- For safety, the combined question + context is capped at ~1,000,000 tokens (approximate). If the limit is exceeded, the request is not sent. Narrow scope with `--only`/`--exclude`.
+- For safety, the combined question + context is capped at ~1,000,000 tokens. If the limit is exceeded, the request is not sent. Narrow scope with `--only`/`--exclude`.
 
 Example:
 
@@ -234,20 +238,17 @@ Example:
 repod --ask "List the main services and where their HTTP routes are defined."
 ```
 
-Important: `--commit` only works when processing the current directory (no CSV or remote URL). For other inputs, the commit step is skipped.
-
 Environment variable:
 
 ```bash
 export GEMINI_API_KEY=your_google_api_key
 ```
 
-Behavior:
-- If the API key is missing or the request fails, a concise fallback message is generated locally.
-- If there are no changes to commit, the step is skipped.
-- The message uses Conventional Commits (e.g., `feat: add search filter`) and includes a brief body.
-- `--commit` is ignored for CSV or remote URLs; no commits are performed in those modes.
- - After committing, if there are leftover uncommitted files, you’ll be prompted (single keypress `y`/`n`) to generate one more AI commit for just those files.
+Clipboard:
+- By default `--ask` does not copy anything. Add `--copy` to copy the full model answer to the clipboard after printing.
+
+Remote repositories with `--ask`:
+- You can pass a single HTTPS/SSH repo URL with `--ask`. The repo is cloned into a temporary directory and analyzed. CSV inputs are not supported with `--ask`.
 
 ### Multi-Commit Planning (`--multi-commit`)
 
