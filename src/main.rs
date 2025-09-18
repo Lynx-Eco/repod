@@ -284,7 +284,8 @@ struct ProcessingStats {
 struct FileContent {
     path: String,
     content: String,
-    tokens: Vec<String>,
+    token_count: usize,
+    metadata_token_count: usize,
 }
 
 fn main() -> Result<()> {
@@ -466,14 +467,24 @@ fn read_file_content(path: &Path) -> Result<String> {
     }
 }
 
+fn build_metadata_block(path: &str) -> String {
+    let display_name = Path::new(path)
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| path.to_string());
+    format!(
+        "<file_info>\npath: {}\nname: {}\n</file_info>\n",
+        path,
+        display_name
+    )
+}
+
 fn process_files_batch(files: &[FileContent], output: &mut dyn Write) -> Result<()> {
     for file in files {
-        // Write file info and content
-        writeln!(output, "<file_info>")?;
-        writeln!(output, "path: {}", file.path)?;
-        writeln!(output, "name: {}", Path::new(&file.path).file_name().unwrap().to_string_lossy())?;
-        writeln!(output, "</file_info>")?;
-        writeln!(output, "{}\n", file.content)?;
+        let metadata_block = build_metadata_block(&file.path);
+        output.write_all(metadata_block.as_bytes())?;
+        output.write_all(file.content.as_bytes())?;
+        output.write_all(b"\n\n")?;
     }
     Ok(())
 }
@@ -787,14 +798,14 @@ fn process_repository(
             }
             
             if let Ok(content) = read_file_content(&readme_path) {
-                let tokens = tokenizer.encode_with_special_tokens(&content);
+                let token_count = tokenizer.encode_ordinary(&content).len();
+                let metadata_block = build_metadata_block(readme_name);
+                let metadata_token_count = tokenizer.encode_ordinary(&metadata_block).len();
                 readme_content = Some(FileContent {
                     path: readme_name.to_string(),
                     content,
-                    tokens: tokens
-                        .iter()
-                        .map(|t| t.to_string())
-                        .collect(),
+                    token_count,
+                    metadata_token_count,
                 });
                 break;
             }
@@ -933,14 +944,14 @@ fn process_repository(
                 .ok()
                 .map(|content| {
                     let relative_path = path.strip_prefix(&repo_dir).unwrap().display().to_string();
-                    let tokens = tokenizer.encode_with_special_tokens(&content);
+                    let token_count = tokenizer.encode_ordinary(&content).len();
+                    let metadata_block = build_metadata_block(&relative_path);
+                    let metadata_token_count = tokenizer.encode_ordinary(&metadata_block).len();
                     FileContent {
                         path: relative_path,
                         content,
-                        tokens: tokens
-                            .iter()
-                            .map(|t| t.to_string())
-                            .collect(),
+                        token_count,
+                        metadata_token_count,
                     }
                 })
         })
@@ -948,17 +959,38 @@ fn process_repository(
 
     process_pb.finish_with_message(format!("Processed {} files", files.len()));
 
+    // Prepare directory tree output for later writing and token accounting
+    let tree = DirectoryTree::build(&repo_dir, &excluded_patterns, &args.only)?;
+    let directory_block = format!(
+        "<directory_structure>\n{}\n</directory_structure>\n\n",
+        tree.format()
+    );
+    let directory_token_count = tokenizer.encode_ordinary(&directory_block).len();
+
+    let file_token_total: usize = files.iter().map(|f| f.token_count).sum();
+    let file_metadata_total: usize = files.iter().map(|f| f.metadata_token_count).sum();
+    let readme_token_total = readme_content.as_ref().map(|f| f.token_count).unwrap_or(0);
+    let readme_metadata_total = readme_content
+        .as_ref()
+        .map(|f| f.metadata_token_count)
+        .unwrap_or(0);
+    let file_count_including_readme = files.len() + (readme_content.is_some() as usize);
+    let spacing_token_unit = tokenizer.encode_ordinary("\n\n").len();
+    let spacing_token_total = spacing_token_unit * file_count_including_readme;
+
     // Update stats
     {
         let mut stats_guard = stats.lock();
         stats_guard.total_files += files.len() + (readme_content.is_some() as usize);
-        stats_guard.total_tokens += files
-            .iter()
-            .map(|f| f.tokens.len())
-            .sum::<usize>();
-        if let Some(ref readme) = readme_content {
-            stats_guard.total_tokens += readme.tokens.len();
-        }
+
+        let repo_token_total = file_token_total
+            + file_metadata_total
+            + directory_token_count
+            + readme_token_total
+            + readme_metadata_total
+            + spacing_token_total;
+        stats_guard.total_tokens += repo_token_total;
+
         stats_guard.processing_time += process_start.elapsed().as_secs_f64();
     }
 
@@ -974,10 +1006,7 @@ fn process_repository(
     let mut output_buffer = Vec::new();
 
     // First, write the directory tree
-    writeln!(&mut output_buffer, "<directory_structure>")?;
-    let tree = DirectoryTree::build(&repo_dir, &excluded_patterns, &args.only)?;
-    writeln!(&mut output_buffer, "{}", tree.format())?;
-    writeln!(&mut output_buffer, "</directory_structure>\n")?;
+    output_buffer.write_all(directory_block.as_bytes())?;
 
     // Write README first if it exists
     if let Some(readme) = readme_content {
