@@ -1,0 +1,92 @@
+name: Publish Homebrew Tap
+
+on:
+  workflow_dispatch: {}
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: read
+
+jobs:
+  update-tap:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set variables
+        id: vars
+        run: |
+          echo "version=${GITHUB_REF_NAME}" >> $GITHUB_OUTPUT
+          echo "repo=${GITHUB_REPOSITORY}" >> $GITHUB_OUTPUT
+          echo "tar_url=https://github.com/${GITHUB_REPOSITORY}/archive/refs/tags/${GITHUB_REF_NAME}.tar.gz" >> $GITHUB_OUTPUT
+
+      - name: Compute sha256 of source tarball
+        id: sha
+        run: |
+          curl -L -o source.tar.gz "${{ steps.vars.outputs.tar_url }}"
+          echo "sha256=$(sha256sum source.tar.gz | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Clone tap repo
+        env:
+          TAP_REPO: ${{ secrets.TAP_REPO }}
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          if [ -z "$TAP_REPO" ] || [ -z "$TAP_PUSH_TOKEN" ]; then
+            echo "TAP_REPO and TAP_PUSH_TOKEN secrets are required." >&2
+            exit 1
+          fi
+          git clone "https://x-access-token:${TAP_PUSH_TOKEN}@github.com/${TAP_REPO}" tap
+          mkdir -p tap/Formula
+
+      - name: Update formula in tap
+        env:
+          VERSION: ${{ steps.vars.outputs.version }}
+          TAR_URL: ${{ steps.vars.outputs.tar_url }}
+          SHA256: ${{ steps.sha.outputs.sha256 }}
+          HOMEPAGE: https://github.com/${{ steps.vars.outputs.repo }}
+        run: |
+          cat > tap/Formula/repod.rb <<'RUBY'
+class Repod < Formula
+  desc "Process repositories, generate trees, and export analyzed contents"
+  homepage "__HOMEPAGE__"
+  url "__TAR_URL__"
+  sha256 "__SHA256__"
+  license "MIT"
+
+  depends_on "rust" => :build
+  depends_on "pkg-config" => :build
+  depends_on "openssl@3"
+
+  def install
+    system "cargo", "build", "--release", "--locked"
+    bin.install "target/release/repod"
+  end
+
+  test do
+    assert_match version.to_s, shell_output("#{bin}/repod -V")
+  end
+end
+RUBY
+          sed -i.bak "s|__HOMEPAGE__|$HOMEPAGE|" tap/Formula/repod.rb
+          sed -i.bak "s|__TAR_URL__|$TAR_URL|" tap/Formula/repod.rb
+          sed -i.bak "s|__SHA256__|$SHA256|" tap/Formula/repod.rb
+          rm -f tap/Formula/repod.rb.bak
+
+      - name: Commit and push to tap
+        env:
+          TAP_PUSH_TOKEN: ${{ secrets.TAP_PUSH_TOKEN }}
+        run: |
+          cd tap
+          git add Formula/repod.rb
+          if git diff --cached --quiet; then
+            echo "No changes to commit."
+            exit 0
+          fi
+          git -c user.name="github-actions" -c user.email="actions@users.noreply.github.com" commit -m "repod ${{ steps.vars.outputs.version }}"
+          git push
+

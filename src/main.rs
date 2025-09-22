@@ -6,7 +6,6 @@ use std::{
     sync::Arc,
     path::PathBuf,
 };
-use glob::Pattern;
 use anyhow::{ Context, Result };
 use clap::Parser;
 use git2::Repository;
@@ -26,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
 use crossterm::{terminal, event::{read, Event, KeyCode}};
 use crossterm::style::Stylize;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 
 mod tree;
 use tree::DirectoryTree;
@@ -211,10 +211,17 @@ struct Args {
     #[arg(short = 'e', long = "exclude", value_delimiter = ',')]
     exclude: Vec<String>,
 
-    /// Only include files matching these patterns (e.g., *.mdx, *.tsx)
-    /// Can be specified multiple times or as a comma-separated list
+    /// Only include files matching these patterns (supports ** globs)
+    /// Can be specified multiple times or as a comma-separated list.
+    /// Bare patterns like "*.rs" implicitly match anywhere (we expand to "**/*.rs").
     #[arg(long = "only", value_delimiter = ',')]
     only: Vec<String>,
+
+    /// Only include files under these directories (relative to repo root)
+    /// Examples: --only-dir src,docs or --only-dir src/lib,examples
+    /// Implemented as globs like "<dir>/**".
+    #[arg(long = "only-dir", value_delimiter = ',')]
+    only_dirs: Vec<String>,
 
     /// Stage and commit changes with an AI-generated message (single commit)
     /// Uses Gemini (models/gemini-2.5-flash) via GEMINI_API_KEY
@@ -257,6 +264,35 @@ fn parse_repo_type(s: &str) -> Result<RepoType, String> {
         "java" => Ok(RepoType::Java),
         _ => Err(format!("Unknown repository type: {}", s)),
     }
+}
+
+fn normalize_rel_path<'a>(path: &'a Path, root: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    let s = rel.to_string_lossy().replace('\\', "/");
+    if s.is_empty() { ".".to_string() } else { s }
+}
+
+fn build_only_globset(only_patterns: &[String], only_dirs: &[String]) -> Option<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    let mut added = 0usize;
+
+    // Directories: turn into <dir>/** globs
+    for d in only_dirs {
+        let d = d.trim_matches('/');
+        if d.is_empty() { continue; }
+        let pat = format!("{}/**", d);
+        if let Ok(glob) = Glob::new(&pat) { builder.add(glob); added += 1; }
+    }
+
+    for pat in only_patterns {
+        let p = pat.trim();
+        if p.is_empty() { continue; }
+        // If pattern has no slash, expand to match anywhere
+        let expanded = if p.contains('/') { p.to_string() } else { format!("**/{}", p) };
+        if let Ok(glob) = Glob::new(&expanded) { builder.add(glob); added += 1; }
+    }
+
+    if added == 0 { None } else { builder.build().ok() }
 }
 
 fn get_repo_type_extensions(repo_type: &RepoType) -> &'static [&'static str] {
@@ -779,22 +815,15 @@ fn process_repository(
     scan_pb.set_message("Scanning repository structure...");
 
     let mut readme_content: Option<FileContent> = None;
+    // Build only-set matcher once for this repo
+    let only_set = build_only_globset(&args.only, &args.only_dirs);
+
     for readme_name in ["README.md", "README.txt", "README", "Readme.md", "readme.md"] {
         let readme_path = repo_dir.join(readme_name);
         if readme_path.exists() && readme_path.is_file() {
-            // Check if README matches the only patterns
-            if !args.only.is_empty() {
-                let matches_pattern = args.only.iter().any(|pattern| {
-                    if let Ok(glob_pattern) = Pattern::new(pattern) {
-                        glob_pattern.matches(readme_name)
-                    } else {
-                        false
-                    }
-                });
-                
-                if !matches_pattern {
-                    continue; // Skip this README if it doesn't match
-                }
+            // Respect only globs (including only-dir)
+            if let Some(ref set) = only_set {
+                if !set.is_match(readme_name) { continue; }
             }
             
             if let Ok(content) = read_file_content(&readme_path) {
@@ -868,8 +897,14 @@ fn process_repository(
             };
             
             let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
-            
-            is_file && !is_excluded && !is_hidden
+
+            if !(is_file && !is_excluded && !is_hidden) { return false; }
+            if let Some(ref set) = only_set {
+                let rel = normalize_rel_path(path, &repo_dir);
+                if !set.is_match(rel) { return false; }
+            }
+
+            true
         })
         .count();
 
@@ -912,7 +947,13 @@ fn process_repository(
                     .unwrap_or(false)
             };
             
-            entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) && !is_excluded && !is_hidden
+            let ok = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) && !is_excluded && !is_hidden;
+            if !ok { return false; }
+            if let Some(ref set) = only_set {
+                let rel = normalize_rel_path(path, &repo_dir);
+                if !set.is_match(rel) { return false; }
+            }
+            true
         })
         .par_bridge()
         .progress_with(process_pb.clone())
@@ -925,11 +966,12 @@ fn process_repository(
                 }
             }
 
-            let should_process = should_process_file(path, if args.repo_types.is_empty() {
-                None
-            } else {
-                Some(&args.repo_types)
-            }, &args.only);
+            let should_process = should_process_file(
+                path,
+                &repo_dir,
+                if args.repo_types.is_empty() { None } else { Some(&args.repo_types) },
+                only_set.as_ref().map(|s| &**s)
+            );
             let is_binary = matches!(is_binary_file(path), Ok(true));
 
             if !should_process || is_binary {
@@ -960,7 +1002,7 @@ fn process_repository(
     process_pb.finish_with_message(format!("Processed {} files", files.len()));
 
     // Prepare directory tree output for later writing and token accounting
-    let tree = DirectoryTree::build(&repo_dir, &excluded_patterns, &args.only)?;
+    let tree = DirectoryTree::build(&repo_dir, &excluded_patterns, &args.only, &args.only_dirs)?;
     let directory_block = format!(
         "<directory_structure>\n{}\n</directory_structure>\n\n",
         tree.format()
@@ -1543,6 +1585,11 @@ fn ask_about_repository(repo_dir: &Path, question: &str, args: &Args, multi_prog
     pb.finish_with_message(format!("{}", "Repository context ready".to_string().green().bold()));
     print_info(&format!("Included files: {} | Context bytes: {}", stats.files, stats.bytes));
 
+    if stats.files == 0 {
+        print_warn("No files matched the current filters. Aborting --ask.\nHint: Adjust --only/--exclude/--only-dir or choose a different path.");
+        return Ok(());
+    }
+
     // Do not copy repo dump by default; we'll copy the final answer if --copy is set
 
     // Build full prompt for token count
@@ -1596,11 +1643,14 @@ fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
         .chain(args.exclude.iter().map(|s| s.as_str()))
         .collect();
 
+    // Build only matcher once
+    let only_set = build_only_globset(&args.only, &args.only_dirs);
+
     // Tree first
     let mut output = String::new();
     let mut files_included = 0usize;
     output.push_str("<directory_structure>\n");
-    let tree = DirectoryTree::build(repo_dir, &excluded_patterns, &args.only)?;
+    let tree = DirectoryTree::build(repo_dir, &excluded_patterns, &args.only, &args.only_dirs)?;
     output.push_str(&tree.format());
     output.push_str("\n</directory_structure>\n\n");
 
@@ -1609,10 +1659,7 @@ fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
     for readme_name in readme_names {
         let readme_path = repo_dir.join(readme_name);
         if readme_path.exists() && readme_path.is_file() {
-            if !args.only.is_empty() {
-                let matches = args.only.iter().any(|pattern| Pattern::new(pattern).map(|p| p.matches(readme_name)).unwrap_or(false));
-                if !matches { continue; }
-            }
+            if let Some(ref set) = only_set { if !set.is_match(readme_name) { continue; } }
             if let Ok(content) = read_file_content(&readme_path) {
                 output.push_str("<file_info>\n");
                 output.push_str(&format!("path: {}\n", readme_name));
@@ -1652,8 +1699,14 @@ fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
         let is_file = result.file_type().map(|ft| ft.is_file()).unwrap_or(false);
         if !is_file { continue; }
 
-        // Respect --only patterns and repo_types
-        if !should_process_file(path, if args.repo_types.is_empty() { None } else { Some(&args.repo_types) }, &args.only) {
+        // Respect only globs
+        if let Some(ref set) = only_set {
+            let rels = normalize_rel_path(path, repo_dir);
+            if !set.is_match(rels) { continue; }
+        }
+
+        // Respect repo_types
+        if !should_process_file(path, repo_dir, if args.repo_types.is_empty() { None } else { Some(&args.repo_types) }, only_set.as_ref().map(|s| &**s)) {
             continue;
         }
         if matches!(is_binary_file(path), Ok(true)) { continue; }
@@ -2248,27 +2301,14 @@ fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
     Ok(ratio <= TEXT_THRESHOLD)
 }
 
-fn should_process_file(path: &Path, repo_types: Option<&[RepoType]>, only_patterns: &[String]) -> bool {
-    // If --only patterns are specified, check against them first
-    if !only_patterns.is_empty() {
-        let path_str = path.to_string_lossy();
-        let file_name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        
-        // Check if any pattern matches the full path or just the filename
-        let matches_pattern = only_patterns.iter().any(|pattern| {
-            if let Ok(glob_pattern) = Pattern::new(pattern) {
-                glob_pattern.matches(&path_str) || glob_pattern.matches(file_name)
-            } else {
-                false
-            }
-        });
-        
-        if !matches_pattern {
-            return false;
-        }
+fn should_process_file(path: &Path, repo_root: &Path, repo_types: Option<&[RepoType]>, only_set: Option<&GlobSet>) -> bool {
+    // If only globs exist, require a match on the repo-relative path
+    if let Some(set) = only_set {
+        let rel = normalize_rel_path(path, repo_root);
+        if !set.is_match(rel) { return false; }
     }
-    
-    // If --only patterns match or are not specified, continue with regular filtering
+
+    // Then continue with regular filtering by repo_types/textness
     match is_text_file(path, repo_types) {
         Ok(is_text) => is_text,
         Err(_) => false,

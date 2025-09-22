@@ -1,7 +1,7 @@
 use std::path::Path;
 use anyhow::Result;
 use std::collections::HashMap;
-use glob::Pattern;
+use globset::{Glob, GlobSet, GlobSetBuilder};
 use ignore::WalkBuilder;
 
 
@@ -12,7 +12,7 @@ pub struct DirectoryTree {
 }
 
 impl DirectoryTree {
-    pub fn build(path: &Path, excluded_patterns: &[&str], only_patterns: &[String]) -> Result<DirectoryTree> {
+    pub fn build(path: &Path, excluded_patterns: &[&str], only_patterns: &[String], only_dirs: &[String]) -> Result<DirectoryTree> {
         let root_name = path
             .file_name()
             .unwrap_or_else(|| path.as_os_str())
@@ -27,6 +27,24 @@ impl DirectoryTree {
 
         // Build a map of parent paths to their children
         let mut path_map: HashMap<String, Vec<DirectoryTree>> = HashMap::new();
+
+        // Build only-globset for file inclusion
+        let mut gs_builder = GlobSetBuilder::new();
+        let mut added = 0usize;
+        for d in only_dirs {
+            let d = d.trim_matches('/');
+            if !d.is_empty() {
+                let pat = format!("{}/**", d);
+                if let Ok(g) = Glob::new(&pat) { gs_builder.add(g); added += 1; }
+            }
+        }
+        for p in only_patterns {
+            let p = p.trim();
+            if p.is_empty() { continue; }
+            let expanded = if p.contains('/') { p.to_string() } else { format!("**/{}", p) };
+            if let Ok(g) = Glob::new(&expanded) { gs_builder.add(g); added += 1; }
+        }
+        let only_set: Option<GlobSet> = if added == 0 { None } else { gs_builder.build().ok() };
 
         // Build the walker with ignore support
         let mut walker_builder = WalkBuilder::new(path);
@@ -64,31 +82,24 @@ impl DirectoryTree {
                         false
                     }
                 });
-                
-                !is_excluded && !is_hidden
+
+                if is_excluded || is_hidden { return false; }
+
+                // Respect only globs for files (directories are kept; pruned later)
+                if let Some(ref set) = only_set {
+                    if let Ok(rel) = entry_path.strip_prefix(path) {
+                        let rels = rel.to_string_lossy().replace('\\', "/");
+                        let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
+                        if is_file && !set.is_match(rels) { return false; }
+                    }
+                }
+
+                true
             }) {
             let entry_path = entry.path();
             let parent_str = entry_path.parent().unwrap().to_string_lossy().to_string();
             let name = entry.file_name().to_string_lossy().to_string();
             let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
-
-            // For files, check if they match the only patterns
-            if is_file && !only_patterns.is_empty() {
-                let path_str = entry_path.to_string_lossy();
-                let file_name = entry_path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-                
-                let matches_pattern = only_patterns.iter().any(|pattern| {
-                    if let Ok(glob_pattern) = Pattern::new(pattern) {
-                        glob_pattern.matches(&path_str) || glob_pattern.matches(file_name)
-                    } else {
-                        false
-                    }
-                });
-                
-                if !matches_pattern {
-                    continue;
-                }
-            }
 
             let node = DirectoryTree {
                 name,
@@ -102,8 +113,8 @@ impl DirectoryTree {
         // Build the tree recursively starting from root
         root.build_recursive(path, &mut path_map);
         
-        // Prune empty directories if only patterns are specified
-        if !only_patterns.is_empty() {
+        // Prune empty directories if any inclusion filters are specified
+        if only_set.is_some() {
             root.prune_empty_directories();
         }
         

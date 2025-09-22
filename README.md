@@ -129,6 +129,9 @@ Options:
   -p, --github-token <GITHUB_TOKEN>  GitHub personal access token for private repositories
   -e, --exclude <EXCLUDE>        Additional folder or path patterns to exclude from processing
       --only <ONLY>              Only include files matching these patterns (e.g., *.mdx, *.tsx)
+      --only-dir <ONLY_DIR>      Only include files under these directories (relative to repo root). Multiple via comma.
+                                 Examples: --only-dir src,docs (includes everything under src/ and docs/)
+                                 Notes: equivalent to adding `<dir>/**` to --only; combine with --only to refine types.
       --ssh-key <SSH_KEY>        SSH key path (defaults to ~/.ssh/id_rsa)
       --ssh-passphrase <SSH_PASSPHRASE>  SSH key passphrase (if not provided, will prompt if needed)
       --open-cursor              Open in Cursor after cloning
@@ -151,7 +154,7 @@ Options:
 - If `-o/--output-dir` is provided, the tool writes to files unless `--copy` is explicitly passed.
 - Use `--write` to force writing; use `--copy` to force copying.
 
-Pattern semantics: `--only` uses simple glob-style patterns via `glob::Pattern`. Wildcards like `*` work for file names; `**` in paths is matched literally and may not behave like full recursive globs in all shells.
+Pattern semantics: `--only` uses globset-style globs with real `**` recursion. Examples: `**/*.rs`, `src/**`, `docs/**/*.md`. Bare patterns like `*.rs` are treated as `**/*.rs` (match in any directory). 
 
 ## Output Format
 
@@ -194,6 +197,20 @@ repod --only "*.mdx,*.tsx"
 
 # Only include files in specific directories matching a pattern
 repod --only "src/**/*.rs,tests/**/*.rs"
+
+### Include Only Specific Directories
+
+```bash
+# Include only the src/ and docs/ trees (all files under them)
+repod --only-dir src,docs
+
+# Combine with --only for file-type refinement
+repod --only-dir src --only "*.rs,*.toml"
+```
+
+Notes on pattern semantics:
+- `--only` uses globset globs (gitignore-like). `**` is recursive; `*` matches within a segment. Bare patterns like `*.rs` match anywhere (internally expanded to `**/*.rs`).
+- `--only-dir` works like adding `<dir>/**` to `--only`. For nested paths, pass e.g. `--only-dir src/lib`.
 ```
 
 ## CSV Input
