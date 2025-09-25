@@ -34,6 +34,7 @@ const LARGE_FILE_THRESHOLD: u64 = 1024 * 1024; // 1MB
 const CHUNK_SIZE: usize = 100;
 const BINARY_CHECK_SIZE: usize = 8192; // Increased binary check size
 const TEXT_THRESHOLD: f32 = 0.3; // Maximum ratio of non-text bytes allowed
+const EMPTY_TREE_HASH: &str = "4b825dc642cb6eb9a060e54bf8d69288fbee4904"; // Git's canonical empty tree
 
 // Common text file extensions that we definitely want to include
 const TEXT_EXTENSIONS: &[&str] = &[
@@ -270,6 +271,10 @@ fn normalize_rel_path<'a>(path: &'a Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let s = rel.to_string_lossy().replace('\\', "/");
     if s.is_empty() { ".".to_string() } else { s }
+}
+
+fn normalize_full_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn build_only_globset(only_patterns: &[String], only_dirs: &[String]) -> Option<GlobSet> {
@@ -874,7 +879,7 @@ fn process_repository(
         .filter_map(Result::ok)
         .filter(|entry| {
             let path = entry.path();
-            let path_str = path.to_string_lossy();
+            let path_str = normalize_full_path(path);
             
             // Check our built-in exclusions
             let is_excluded = excluded_patterns.iter().any(|pattern| path_str.contains(pattern));
@@ -925,7 +930,7 @@ fn process_repository(
         .filter_map(Result::ok)
         .filter(|entry| {
             let path = entry.path();
-            let path_str = path.to_string_lossy();
+            let path_str = normalize_full_path(path);
             
             // Check our built-in exclusions
             let is_excluded = excluded_patterns.iter().any(|pattern| path_str.contains(pattern));
@@ -970,7 +975,7 @@ fn process_repository(
                 path,
                 &repo_dir,
                 if args.repo_types.is_empty() { None } else { Some(&args.repo_types) },
-                only_set.as_ref().map(|s| &**s)
+                only_set.as_ref()
             );
             let is_binary = matches!(is_binary_file(path), Ok(true));
 
@@ -1130,12 +1135,13 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress, branch
     pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("Generating single-commit proposal...");
-    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
-    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
-    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", "HEAD"])?;
+    let diff_base = diff_base_ref(repo_dir);
+    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", diff_base])?;
+    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", diff_base])?;
+    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", diff_base])?;
     let changes_box = build_changes_summary_box(&numstat, &shortstat, 50);
     print_boxed("Changes", &changes_box);
-    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])? , 20_000);
+    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", diff_base])?, 20_000);
     let prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
     let msg = match generate_commit_message_via_gemini(&prompt) {
         Ok(m) => m,
@@ -1195,8 +1201,9 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("Analyzing multi-commit plan...");
     let (commits, leftovers) = plan_multi_commits(repo_dir, multi_progress)?;
-    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
-    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", "HEAD"])?;
+    let diff_base = diff_base_ref(repo_dir);
+    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", diff_base])?;
+    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", diff_base])?;
     let changes_box = build_changes_summary_box(&numstat, &shortstat, 50);
     print_boxed("Changes", &changes_box);
     pb.finish_with_message(format!("{}", "Multi-commit analysis complete".to_string().green().bold()));
@@ -1210,8 +1217,8 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_
         println!("");
 
         // Per-commit change summary (shortstat + numstat scoped to these files)
-        let mut shortstat_args = vec!["git".to_string(), "diff".to_string(), "--shortstat".to_string(), "HEAD".to_string(), "--".to_string()];
-        let mut numstat_args = vec!["git".to_string(), "diff".to_string(), "--numstat".to_string(), "HEAD".to_string(), "--".to_string()];
+        let mut shortstat_args = vec!["git".to_string(), "diff".to_string(), "--shortstat".to_string(), diff_base.to_string(), "--".to_string()];
+        let mut numstat_args = vec!["git".to_string(), "diff".to_string(), "--numstat".to_string(), diff_base.to_string(), "--".to_string()];
         for f in &c.files { shortstat_args.push(f.clone()); numstat_args.push(f.clone()); }
         if let Ok(shortstat_scoped) = run_in_repo_strings(repo_dir, shortstat_args) {
             if let Ok(numstat_scoped) = run_in_repo_strings(repo_dir, numstat_args) {
@@ -1280,8 +1287,35 @@ fn run_in_repo(repo_dir: &Path, args: &[&str]) -> Result<String> {
     }
 }
 
+fn git_has_head(repo_dir: &Path) -> bool {
+    Command::new("git")
+        .args(["rev-parse", "--verify", "HEAD"])
+        .current_dir(repo_dir)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+fn diff_base_ref(repo_dir: &Path) -> &'static str {
+    if git_has_head(repo_dir) { "HEAD" } else { EMPTY_TREE_HASH }
+}
+
 fn truncate(s: &str, max: usize) -> String {
-    if s.len() <= max { s.to_string() } else { format!("{}\n…[truncated]", &s[..max]) }
+    if s.len() <= max {
+        return s.to_string();
+    }
+
+    let mut end = max.min(s.len());
+    while end > 0 && !s.is_char_boundary(end) {
+        end -= 1;
+    }
+
+    let prefix = &s[..end];
+    if prefix.len() == s.len() {
+        s.to_string()
+    } else {
+        format!("{}\n…[truncated]", prefix)
+    }
 }
 
 fn prompt_yes_no_keypress(prompt: &str) -> Result<bool> {
@@ -1475,10 +1509,11 @@ fn plan_multi_commits(repo_dir: &Path, _multi_progress: &MultiProgress) -> Resul
     }
 
     // Gather change context
-    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", "HEAD"])?;
-    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", "HEAD"])?;
-    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
-    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", "HEAD"])? , 40_000);
+    let diff_base = diff_base_ref(repo_dir);
+    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", diff_base])?;
+    let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", diff_base])?;
+    let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", diff_base])?;
+    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", diff_base])?, 40_000);
 
     let plan_prompt = build_multi_commit_prompt(&name_status, &numstat, &shortstat, &diff_sample);
     let plan = match generate_commit_plan_via_gemini(&plan_prompt) {
@@ -1686,7 +1721,7 @@ fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
     for result in walker_builder.build().filter_map(Result::ok) {
         let path = result.path();
         if path == repo_dir { continue; }
-        let path_str = path.to_string_lossy();
+        let path_str = normalize_full_path(path);
         // Exclusions
         if excluded_patterns.iter().any(|p| path_str.contains(p)) {
             continue;
@@ -1706,7 +1741,7 @@ fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
         }
 
         // Respect repo_types
-        if !should_process_file(path, repo_dir, if args.repo_types.is_empty() { None } else { Some(&args.repo_types) }, only_set.as_ref().map(|s| &**s)) {
+        if !should_process_file(path, repo_dir, if args.repo_types.is_empty() { None } else { Some(&args.repo_types) }, only_set.as_ref()) {
             continue;
         }
         if matches!(is_binary_file(path), Ok(true)) { continue; }
@@ -1871,7 +1906,8 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
 // -------- Leftover helpers --------
 
 fn list_changed_files_vs_head(repo_dir: &Path) -> Result<Vec<String>> {
-    let out = run_in_repo(repo_dir, &["git", "diff", "--name-only", "HEAD"])?;
+    let base = diff_base_ref(repo_dir);
+    let out = run_in_repo(repo_dir, &["git", "diff", "--name-only", base])?;
     let files: Vec<String> = out
         .lines()
         .map(|s| s.trim())
@@ -1898,9 +1934,10 @@ fn run_in_repo_strings(repo_dir: &Path, args: Vec<String>) -> Result<String> {
 }
 
 fn diff_context_for_files(repo_dir: &Path, files: &Vec<String>) -> Result<(String, String, String)> {
-    let mut name_status_args = vec!["git".to_string(), "diff".to_string(), "--name-status".to_string(), "HEAD".to_string(), "--".to_string()];
-    let mut shortstat_args = vec!["git".to_string(), "diff".to_string(), "--shortstat".to_string(), "HEAD".to_string(), "--".to_string()];
-    let mut diff_args = vec!["git".to_string(), "diff".to_string(), "-U3".to_string(), "HEAD".to_string(), "--".to_string()];
+    let base = diff_base_ref(repo_dir);
+    let mut name_status_args = vec!["git".to_string(), "diff".to_string(), "--name-status".to_string(), base.to_string(), "--".to_string()];
+    let mut shortstat_args = vec!["git".to_string(), "diff".to_string(), "--shortstat".to_string(), base.to_string(), "--".to_string()];
+    let mut diff_args = vec!["git".to_string(), "diff".to_string(), "-U3".to_string(), base.to_string(), "--".to_string()];
     for f in files { name_status_args.push(f.clone()); shortstat_args.push(f.clone()); diff_args.push(f.clone()); }
     let name_status = run_in_repo_strings(repo_dir, name_status_args)?;
     let shortstat = run_in_repo_strings(repo_dir, shortstat_args)?;
@@ -2184,8 +2221,9 @@ fn try_push(repo_dir: &Path, branch: &str) -> Result<()> {
 
 fn generate_branch_name(repo_dir: &Path) -> Result<String> {
     // Use diff to propose a branch name via Gemini
-    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-only", "HEAD"])?;
-    let summary = run_in_repo(repo_dir, &["git", "diff", "--shortstat", "HEAD"])?;
+    let diff_base = diff_base_ref(repo_dir);
+    let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-only", diff_base])?;
+    let summary = run_in_repo(repo_dir, &["git", "diff", "--shortstat", diff_base])?;
     let prompt = format!(
         "Propose a short git branch name based on these changes.\n\
         Rules: lowercase, words separated by '-', prefix with a conventional type (feat|fix|chore|refactor|docs|test|perf), optional scope in words, max 48 chars total, no spaces, only [a-z0-9-].\n\
@@ -2199,7 +2237,8 @@ fn generate_branch_name(repo_dir: &Path) -> Result<String> {
 }
 
 fn heuristic_branch_name(repo_dir: &Path) -> Result<String> {
-    let files = run_in_repo(repo_dir, &["git", "diff", "--name-only", "HEAD"])?;
+    let diff_base = diff_base_ref(repo_dir);
+    let files = run_in_repo(repo_dir, &["git", "diff", "--name-only", diff_base])?;
     let first = files.lines().find(|l| !l.trim().is_empty()).unwrap_or("changes");
     let scope = first.split('/').next().unwrap_or("changes");
     let date = chrono::Local::now().format("%Y%m%d");
@@ -2221,7 +2260,7 @@ fn sanitize_branch_name(s: &str) -> String {
 
 fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
     // First check the path against excluded patterns
-    let path_str = path.to_string_lossy();
+    let path_str = normalize_full_path(path);
     if EXCLUDED_PATTERNS.iter().any(|pattern| path_str.contains(pattern)) {
         return Ok(false);
     }
@@ -2234,17 +2273,19 @@ fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
 
     // If repo_types is specified, check if file matches any of the types
     if let Some(repo_types) = repo_types {
-        if let Some(ext) = path.extension() {
-            let ext_str = ext.to_string_lossy().to_lowercase();
-            return Ok(
-                repo_types
-                    .iter()
-                    .any(|repo_type| {
-                        get_repo_type_extensions(repo_type).contains(&ext_str.as_str())
-                    })
-            );
-        }
-        return Ok(false);
+        let ext_lower = path.extension().map(|ext| ext.to_string_lossy().to_lowercase());
+        let file_lower = path.file_name().and_then(|name| name.to_str()).map(|s| s.to_lowercase());
+
+        return Ok(repo_types.iter().any(|repo_type| {
+            let patterns = get_repo_type_extensions(repo_type);
+            let ext_match = ext_lower
+                .as_deref()
+                .map_or(false, |ext| patterns.iter().any(|&p| p == ext));
+            let file_match = file_lower
+                .as_deref()
+                .map_or(false, |name| patterns.iter().any(|&p| p == name));
+            ext_match || file_match
+        }));
     }
 
     // If no repo_types specified, use the original text file detection logic
@@ -2321,9 +2362,38 @@ fn extract_repo_name(url: &str) -> String {
 }
 
 fn is_binary_file(path: &Path) -> Result<bool> {
-    // First check if we can detect the file type
+    // First check if we can detect the file type. Prefer an explicit allow/deny
+    // list rather than assuming every non-`text/` MIME is binary because many
+    // textual assets are tagged as `application/*` (Package manifests, JSON, etc.).
     if let Some(kind) = infer::get_from_path(path)? {
-        return Ok(!kind.mime_type().starts_with("text/"));
+        let mime = kind.mime_type();
+        let is_text_mime = mime.starts_with("text/") || matches!(
+            mime,
+            "application/json"
+                | "application/ld+json"
+                | "application/xml"
+                | "application/javascript"
+                | "application/x-javascript"
+                | "application/sql"
+                | "application/yaml"
+                | "application/toml"
+                | "application/graphql"
+                | "application/x-sh"
+        );
+        if is_text_mime {
+            return Ok(false);
+        }
+
+        let is_known_binary = mime.starts_with("image/")
+            || mime.starts_with("audio/")
+            || mime.starts_with("video/")
+            || mime == "application/octet-stream"
+            || mime == "application/pdf"
+            || mime == "application/zip"
+            || mime == "application/x-executable";
+        if is_known_binary {
+            return Ok(true);
+        }
     }
 
     // If we can't detect the type, try to read the first few bytes

@@ -67,7 +67,7 @@ impl DirectoryTree {
                     return false;
                 }
                 
-                let path_str = entry_path.to_string_lossy();
+                let path_str = entry_path.to_string_lossy().replace('\\', "/");
                 
                 // Check excluded patterns
                 let is_excluded = excluded_patterns
@@ -97,7 +97,7 @@ impl DirectoryTree {
                 true
             }) {
             let entry_path = entry.path();
-            let parent_str = entry_path.parent().unwrap().to_string_lossy().to_string();
+            let parent_str = entry_path.parent().unwrap().to_string_lossy().replace('\\', "/");
             let name = entry.file_name().to_string_lossy().to_string();
             let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
 
@@ -128,7 +128,7 @@ impl DirectoryTree {
         current_path: &Path,
         path_map: &mut HashMap<String, Vec<DirectoryTree>>
     ) {
-        let current_path_str = current_path.to_string_lossy().to_string();
+        let current_path_str = current_path.to_string_lossy().replace('\\', "/");
         if let Some(children) = path_map.remove(&current_path_str) {
             for mut child in children {
                 if !child.is_file {
