@@ -1427,6 +1427,10 @@ fn fallback_commit_message_multiline(name_status: &str, shortstat: &str) -> Stri
 #[derive(Serialize)]
 struct GeminiRequest<'a> {
     contents: Vec<GeminiContent<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<GeminiTool<'a>>>,
+    #[serde(rename = "toolConfig", skip_serializing_if = "Option::is_none")]
+    tool_config: Option<GeminiToolConfig<'a>>,
 }
 
 #[derive(Serialize)]
@@ -1453,7 +1457,44 @@ struct GeminiGeneratedContent {
 }
 
 #[derive(Deserialize)]
-struct GeminiGeneratedPart { text: Option<String> }
+struct GeminiGeneratedPart {
+    text: Option<String>,
+    #[serde(rename = "functionCall")]
+    function_call: Option<GeminiFunctionCall>,
+}
+
+#[derive(Deserialize)]
+struct GeminiFunctionCall {
+    name: String,
+    #[serde(default)]
+    args: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct GeminiTool<'a> {
+    #[serde(rename = "functionDeclarations")]
+    function_declarations: Vec<GeminiFunctionDeclaration<'a>>,
+}
+
+#[derive(Serialize)]
+struct GeminiFunctionDeclaration<'a> {
+    name: &'a str,
+    description: &'a str,
+    parameters: serde_json::Value,
+}
+
+#[derive(Serialize)]
+struct GeminiToolConfig<'a> {
+    #[serde(rename = "functionCallingConfig")]
+    function_calling_config: GeminiFunctionCallingConfig<'a>,
+}
+
+#[derive(Serialize)]
+struct GeminiFunctionCallingConfig<'a> {
+    mode: &'a str,
+    #[serde(rename = "allowedFunctionNames", skip_serializing_if = "Option::is_none")]
+    allowed_function_names: Option<Vec<&'a str>>,
+}
 
 fn generate_commit_message_via_gemini(prompt: &str) -> Result<String> {
     let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
@@ -1463,7 +1504,7 @@ fn generate_commit_message_via_gemini(prompt: &str) -> Result<String> {
         model, api_key
     );
 
-    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: prompt }] }] };
+    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: prompt }] }], tools: None, tool_config: None };
     let resp: GeminiResponse = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_json(serde_json::to_value(&req)?)
@@ -1582,7 +1623,43 @@ fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
         model, api_key
     );
 
-    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: prompt }] }] };
+    // Declare a function tool for structured multi-commit planning
+    let params_schema = serde_json::json!({
+        "type": "object",
+        "properties": {
+            "commits": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string" },
+                        "body":  { "type": "string" },
+                        "files": { "type": "array", "items": { "type": "string" } }
+                    },
+                    "required": ["title", "files"]
+                }
+            }
+        },
+        "required": ["commits"]
+    });
+
+    let req = GeminiRequest {
+        contents: vec![GeminiContent { parts: vec![GeminiPart { text: prompt }] }],
+        tools: Some(vec![GeminiTool {
+            function_declarations: vec![GeminiFunctionDeclaration {
+                name: "propose_commit_plan",
+                description: "Propose a logical multi-commit plan for the provided repository changes.",
+                parameters: params_schema,
+            }],
+        }]),
+        tool_config: Some(GeminiToolConfig {
+            function_calling_config: GeminiFunctionCallingConfig {
+                mode: "ANY",
+                allowed_function_names: Some(vec!["propose_commit_plan"]),
+            },
+        }),
+    };
+
     let resp: GeminiResponse = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_json(serde_json::to_value(&req)?)
@@ -1590,19 +1667,95 @@ fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
         .into_json()
         .map_err(|e| anyhow::anyhow!("invalid Gemini JSON: {}", e))?;
 
-    let text = resp
-        .candidates
-        .and_then(|mut v| v.pop())
-        .and_then(|c| c.content)
-        .and_then(|c| c.parts)
-        .and_then(|mut parts| parts.pop())
-        .and_then(|p| p.text)
-        .ok_or_else(|| anyhow::anyhow!("empty model response"))?;
+    // Prefer tool-calling path: extract function call arguments
+    let candidates = resp.candidates.unwrap_or_default();
+    for cand in &candidates {
+            if let Some(content) = &cand.content {
+                if let Some(parts) = &content.parts {
+                    for part in parts {
+                        if let Some(fc) = &part.function_call {
+                            // Accept only our declared function
+                            if fc.name == "propose_commit_plan" {
+                                // args might be a struct or a JSON string – handle both
+                                let plan_res: Result<CommitPlanResponse> = match &fc.args {
+                                    serde_json::Value::String(s) => {
+                                        if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(s) {
+                                            Ok(plan)
+                                        } else if let Ok(commits) = serde_json::from_str::<Vec<CommitPlan>>(s) {
+                                            Ok(CommitPlanResponse { commits })
+                                        } else {
+                                            Err(anyhow::anyhow!("functionCall args string not valid plan JSON"))
+                                        }
+                                    }
+                                    v => {
+                                        if let Ok(plan) = serde_json::from_value::<CommitPlanResponse>(v.clone()) {
+                                            Ok(plan)
+                                        } else if let Ok(commits) = serde_json::from_value::<Vec<CommitPlan>>(v.clone()) {
+                                            Ok(CommitPlanResponse { commits })
+                                        } else {
+                                            Err(anyhow::anyhow!("functionCall args not valid plan JSON"))
+                                        }
+                                    }
+                                };
+                                if let Ok(plan) = plan_res { return Ok(plan); }
+                            }
+                        }
+                    }
+                }
+            }
+    }
 
-    // Attempt to parse the returned text as JSON plan
-    let plan: CommitPlanResponse = serde_json::from_str(text.trim())
-        .map_err(|e| anyhow::anyhow!("failed to parse plan JSON: {}", e))?;
-    Ok(plan)
+    // Fallback: parse any text output as before (robust JSON extraction)
+    let mut last_text: Option<String> = None;
+    for cand in candidates {
+        if let Some(content) = cand.content {
+            if let Some(parts) = content.parts {
+                for part in parts {
+                    if let Some(t) = part.text { last_text = Some(t); }
+                }
+            }
+        }
+    }
+
+    fn extract_json_candidate(s: &str) -> Option<String> {
+        let t = s.trim();
+        if t.is_empty() { return None; }
+        if let Some(start) = t.find("```") {
+            let after = &t[start + 3..];
+            let after = after.strip_prefix("json").or_else(|| after.strip_prefix("JSON")).unwrap_or(after);
+            let after = after.strip_prefix('\n').unwrap_or(after);
+            if let Some(end_rel) = after.find("```") {
+                let block = &after[..end_rel];
+                let block_trim = block.trim();
+                if block_trim.starts_with('{') || block_trim.starts_with('[') { return Some(block_trim.to_string()); }
+            }
+        }
+        let mut depth = 0usize; let mut start_idx: Option<usize> = None;
+        for (i, ch) in t.char_indices() {
+            match ch {
+                '{' => { if depth == 0 { start_idx = Some(i); } depth += 1; }
+                '}' => {
+                    if depth > 0 { depth -= 1; }
+                    if depth == 0 { if let Some(s0) = start_idx { return Some(t[s0..=i].to_string()); } }
+                }
+                _ => {}
+            }
+        }
+        // Try array scanning
+        if let Some(s0) = t.find('[') { if let Some(s1) = t.rfind(']') { if s1 > s0 { return Some(t[s0..=s1].to_string()); } } }
+        None
+    }
+
+    if let Some(text) = last_text {        
+        let trimmed = text.trim();
+        if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(trimmed) { return Ok(plan); }
+        if let Some(candidate) = extract_json_candidate(trimmed) {
+            if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(&candidate) { return Ok(plan); }
+            if let Ok(commits) = serde_json::from_str::<Vec<CommitPlan>>(&candidate) { return Ok(CommitPlanResponse { commits }); }
+        }
+        if let Ok(commits) = serde_json::from_str::<Vec<CommitPlan>>(trimmed) { return Ok(CommitPlanResponse { commits }); }
+    }
+    anyhow::bail!("no function call found and could not parse text output as JSON")
 }
 
 // -------------------- Ask repo (Q&A) --------------------
@@ -1779,7 +1932,7 @@ fn generate_repo_answer_via_gemini(question: &str, repo_dump: &str) -> Result<St
         question.trim(), repo_dump
     );
 
-    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: &prompt }] }] };
+    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: &prompt }] }], tools: None, tool_config: None };
     let resp: GeminiResponse = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_json(serde_json::to_value(&req)?)
@@ -1818,7 +1971,7 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
         question.trim(), repo_dump
     );
 
-    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: &prompt }] }] };
+    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: &prompt }] }], tools: None, tool_config: None };
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
         .set("Accept", "text/event-stream")
