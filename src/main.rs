@@ -1,31 +1,34 @@
-use std::{
-    fs::{ self, File },
-    io::{ Write, BufReader, Read },
-    path::Path,
-    time::Instant,
-    sync::Arc,
-    path::PathBuf,
-};
-use anyhow::{ Context, Result };
-use clap::Parser;
-use git2::Repository;
-use tempfile::TempDir;
-use ignore::{WalkBuilder, DirEntry};
-use tiktoken_rs::o200k_base;
+use anyhow::{Context, Result};
 use chrono::Local;
+use clap::Parser;
+use copypasta::{ClipboardContext, ClipboardProvider};
+use crossterm::style::Stylize;
+use crossterm::{
+    event::{read, Event, KeyCode},
+    terminal,
+};
+use dirs;
+use git2::Repository;
+use globset::{Glob, GlobSet, GlobSetBuilder};
+use ignore::{DirEntry, WalkBuilder};
+use indicatif::{MultiProgress, ParallelProgressIterator, ProgressBar, ProgressStyle};
+use infer;
+use memmap2::Mmap;
 use parking_lot::Mutex;
 use rayon::prelude::*;
-use memmap2::Mmap;
-use infer;
-use dirs;
-use copypasta::{ ClipboardContext, ClipboardProvider };
-use indicatif::{ ProgressBar, ProgressStyle, MultiProgress, ParallelProgressIterator };
-use std::process::Command;
 use serde::{Deserialize, Serialize};
 use std::ffi::OsStr;
-use crossterm::{terminal, event::{read, Event, KeyCode}};
-use crossterm::style::Stylize;
-use globset::{Glob, GlobSet, GlobSetBuilder};
+use std::process::Command;
+use std::{
+    fs::{self, File},
+    io::{BufReader, Read, Write},
+    path::Path,
+    path::PathBuf,
+    sync::Arc,
+    time::Instant,
+};
+use tempfile::TempDir;
+use tiktoken_rs::o200k_base;
 
 mod tree;
 use tree::DirectoryTree;
@@ -270,11 +273,11 @@ fn parse_repo_type(s: &str) -> Result<RepoType, String> {
 fn normalize_rel_path<'a>(path: &'a Path, root: &Path) -> String {
     let rel = path.strip_prefix(root).unwrap_or(path);
     let s = rel.to_string_lossy().replace('\\', "/");
-    if s.is_empty() { ".".to_string() } else { s }
-}
-
-fn normalize_full_path(path: &Path) -> String {
-    path.to_string_lossy().replace('\\', "/")
+    if s.is_empty() {
+        ".".to_string()
+    } else {
+        s
+    }
 }
 
 fn build_only_globset(only_patterns: &[String], only_dirs: &[String]) -> Option<GlobSet> {
@@ -284,29 +287,117 @@ fn build_only_globset(only_patterns: &[String], only_dirs: &[String]) -> Option<
     // Directories: turn into <dir>/** globs
     for d in only_dirs {
         let d = d.trim_matches('/');
-        if d.is_empty() { continue; }
+        if d.is_empty() {
+            continue;
+        }
         let pat = format!("{}/**", d);
-        if let Ok(glob) = Glob::new(&pat) { builder.add(glob); added += 1; }
+        if let Ok(glob) = Glob::new(&pat) {
+            builder.add(glob);
+            added += 1;
+        }
     }
 
     for pat in only_patterns {
         let p = pat.trim();
-        if p.is_empty() { continue; }
+        if p.is_empty() {
+            continue;
+        }
         // If pattern has no slash, expand to match anywhere
-        let expanded = if p.contains('/') { p.to_string() } else { format!("**/{}", p) };
-        if let Ok(glob) = Glob::new(&expanded) { builder.add(glob); added += 1; }
+        let expanded = if p.contains('/') {
+            p.to_string()
+        } else {
+            format!("**/{}", p)
+        };
+        if let Ok(glob) = Glob::new(&expanded) {
+            builder.add(glob);
+            added += 1;
+        }
     }
 
-    if added == 0 { None } else { builder.build().ok() }
+    if added == 0 {
+        None
+    } else {
+        builder.build().ok()
+    }
+}
+
+fn build_exclude_globset(builtin_patterns: &[&str], user_patterns: &[String]) -> Option<GlobSet> {
+    let mut builder = GlobSetBuilder::new();
+    let mut added = 0usize;
+
+    for pattern in builtin_patterns
+        .iter()
+        .copied()
+        .chain(user_patterns.iter().map(|s| s.as_str()))
+    {
+        if let Some(glob_pattern) = normalize_exclude_pattern(pattern) {
+            if let Ok(glob) = Glob::new(&glob_pattern) {
+                builder.add(glob);
+                added += 1;
+            }
+        }
+    }
+
+    if added == 0 {
+        None
+    } else {
+        builder.build().ok()
+    }
+}
+
+fn normalize_exclude_pattern(pattern: &str) -> Option<String> {
+    let raw = pattern.trim();
+    if raw.is_empty() {
+        return None;
+    }
+
+    let cleaned = raw.trim_start_matches("./").replace('\\', "/");
+    if cleaned.is_empty() {
+        return None;
+    }
+
+    if cleaned.ends_with('/') {
+        let dir = cleaned.trim_end_matches('/');
+        if dir.is_empty() {
+            return None;
+        }
+        let dir = dir.trim_start_matches('/');
+        if dir.is_empty() {
+            return None;
+        }
+        Some(format!("**/{}/**", dir))
+    } else {
+        let target = cleaned.trim_start_matches('/');
+        if target.starts_with("**/") {
+            Some(target.to_string())
+        } else {
+            Some(format!("**/{}", target))
+        }
+    }
 }
 
 fn get_repo_type_extensions(repo_type: &RepoType) -> &'static [&'static str] {
     match repo_type {
         RepoType::Rust => &["rs", "toml"],
-        RepoType::Python =>
-            &["py", "pyi", "pyx", "pxd", "requirements.txt", "setup.py", "pyproject.toml"],
-        RepoType::JavaScript =>
-            &["js", "jsx", "ts", "tsx", "json", "package.json", "tsconfig.json", "jsconfig.json"],
+        RepoType::Python => &[
+            "py",
+            "pyi",
+            "pyx",
+            "pxd",
+            "requirements.txt",
+            "setup.py",
+            "pyproject.toml",
+        ],
+        RepoType::JavaScript => &[
+            "js",
+            "jsx",
+            "ts",
+            "tsx",
+            "json",
+            "package.json",
+            "tsconfig.json",
+            "jsconfig.json",
+        ],
         RepoType::Go => &["go", "mod", "sum"],
         RepoType::Java => &["java", "gradle", "maven", "pom.xml", "build.gradle"],
     }
@@ -440,19 +531,17 @@ fn main() -> Result<()> {
     // Process repositories in parallel if there are multiple
     let do_parallel = urls.len() > 1;
     if do_parallel {
-        urls
-            .par_iter()
-            .try_for_each(|url| {
-                process_repository(
-                    url,
-                    &args.output_dir,
-                    Arc::clone(&stats),
-                    &args,
-                    copy_mode_global,
-                    commit_allowed && url == ".",
-                    Arc::clone(&multi_progress)
-                )
-            })?;
+        urls.par_iter().try_for_each(|url| {
+            process_repository(
+                url,
+                &args.output_dir,
+                Arc::clone(&stats),
+                &args,
+                copy_mode_global,
+                commit_allowed && url == ".",
+                Arc::clone(&multi_progress),
+            )
+        })?;
     } else {
         process_repository(
             &urls[0],
@@ -461,7 +550,7 @@ fn main() -> Result<()> {
             &args,
             copy_mode_global,
             commit_allowed,
-            Arc::clone(&multi_progress)
+            Arc::clone(&multi_progress),
         )?;
     }
 
@@ -515,8 +604,7 @@ fn build_metadata_block(path: &str) -> String {
         .unwrap_or_else(|| path.to_string());
     format!(
         "<file_info>\npath: {}\nname: {}\n</file_info>\n",
-        path,
-        display_name
+        path, display_name
     )
 }
 
@@ -531,10 +619,9 @@ fn process_files_batch(files: &[FileContent], output: &mut dyn Write) -> Result<
 }
 
 fn handle_auth_error(url: &str, error: &git2::Error) -> anyhow::Error {
-    let is_auth_error =
-        error.code() == git2::ErrorCode::Auth ||
-        error.message().contains("authentication") ||
-        error.message().contains("authorization");
+    let is_auth_error = error.code() == git2::ErrorCode::Auth
+        || error.message().contains("authentication")
+        || error.message().contains("authorization");
 
     if is_auth_error {
         let mut msg = String::from("\nAuthentication failed. To fix this:\n");
@@ -545,7 +632,7 @@ fn handle_auth_error(url: &str, error: &git2::Error) -> anyhow::Error {
                 1. Set your GitHub token using one of these methods:\n\
                    - Run with --github-token YOUR_TOKEN\n\
                    - Set the GITHUB_TOKEN environment variable\n\
-                2. Ensure your token has the 'repo' scope enabled\n"
+                2. Ensure your token has the 'repo' scope enabled\n",
             );
         } else if url.starts_with("git@") {
             msg.push_str(
@@ -554,13 +641,13 @@ fn handle_auth_error(url: &str, error: &git2::Error) -> anyhow::Error {
                    - Default location: ~/.ssh/id_rsa\n\
                    - Or specify with --ssh-key /path/to/key\n\
                 2. Verify your SSH key is added to GitHub\n\
-                3. Test SSH access: ssh -T git@github.com\n"
+                3. Test SSH access: ssh -T git@github.com\n",
             );
         } else {
             msg.push_str(
                 "Ensure you're using either:\n\
                 - HTTPS URL (https://github.com/org/repo)\n\
-                - SSH URL (git@github.com:org/repo)\n"
+                - SSH URL (git@github.com:org/repo)\n",
             );
         }
 
@@ -587,7 +674,7 @@ fn clone_repository(
     url: &str,
     path: &Path,
     args: &Args,
-    multi_progress: &MultiProgress
+    multi_progress: &MultiProgress,
 ) -> Result<Repository> {
     let mut callbacks = git2::RemoteCallbacks::new();
     let mut fetch_options = git2::FetchOptions::new();
@@ -599,7 +686,7 @@ fn clone_repository(
         ProgressStyle::default_spinner()
             .template("{spinner:.green} {msg} [{elapsed_precise}]")
             .unwrap()
-            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏")
+            .tick_chars("⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"),
     );
     clone_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
@@ -617,7 +704,9 @@ fn clone_repository(
                     });
                     fetch_options.remote_callbacks(callbacks);
                     builder.fetch_options(fetch_options);
-                    builder.clone(url, path).map_err(|e| handle_auth_error(url, &e))
+                    builder
+                        .clone(url, path)
+                        .map_err(|e| handle_auth_error(url, &e))
                 } else {
                     Err(
                         anyhow::anyhow!(
@@ -635,23 +724,18 @@ fn clone_repository(
     } else if url.starts_with("git@") {
         clone_pb.set_message(format!("Setting up SSH connection to: {}", url));
 
-        let ssh_key_path = args.ssh_key
-            .as_ref()
-            .map(PathBuf::from)
-            .unwrap_or_else(|| {
-                let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-                PathBuf::from(home).join(".ssh/id_rsa")
-            });
+        let ssh_key_path = args.ssh_key.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+            let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+            PathBuf::from(home).join(".ssh/id_rsa")
+        });
 
         if !ssh_key_path.exists() {
             clone_pb.finish_with_message("✗ SSH key not found");
-            return Err(
-                anyhow::anyhow!(
-                    "SSH key not found at {}.\n\
+            return Err(anyhow::anyhow!(
+                "SSH key not found at {}.\n\
                 Please ensure your SSH key exists or specify a different path with --ssh-key",
-                    ssh_key_path.display()
-                )
-            );
+                ssh_key_path.display()
+            ));
         }
 
         // First try without passphrase
@@ -662,7 +746,7 @@ fn clone_repository(
                 _username_from_url.unwrap_or("git"),
                 None,
                 &ssh_key_path,
-                passphrase.as_deref()
+                passphrase.as_deref(),
             )
         });
         fetch_options.remote_callbacks(callbacks);
@@ -671,30 +755,26 @@ fn clone_repository(
         let clone_result = builder.clone(url, path);
 
         if let Err(e) = &clone_result {
-            if
-                e.class() == git2::ErrorClass::Ssh &&
-                e.message().contains("Unable to extract public key") &&
-                args.ssh_passphrase.is_none()
+            if e.class() == git2::ErrorClass::Ssh
+                && e.message().contains("Unable to extract public key")
+                && args.ssh_passphrase.is_none()
             {
                 // Try again with passphrase
                 let passphrase = prompt_passphrase(&clone_pb)?;
 
                 clone_pb.set_message(format!("Retrying SSH connection to: {}", url));
                 let mut callbacks = git2::RemoteCallbacks::new();
-                let ssh_key_path = args.ssh_key
-                    .as_ref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| {
-                        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-                        PathBuf::from(home).join(".ssh/id_rsa")
-                    });
+                let ssh_key_path = args.ssh_key.as_ref().map(PathBuf::from).unwrap_or_else(|| {
+                    let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+                    PathBuf::from(home).join(".ssh/id_rsa")
+                });
 
                 callbacks.credentials(move |_url, _username_from_url, _allowed_types| {
                     git2::Cred::ssh_key(
                         _username_from_url.unwrap_or("git"),
                         None,
                         &ssh_key_path,
-                        Some(&passphrase)
+                        Some(&passphrase),
                     )
                 });
 
@@ -702,7 +782,9 @@ fn clone_repository(
                 fetch_options.remote_callbacks(callbacks);
                 builder.fetch_options(fetch_options);
 
-                builder.clone(url, path).map_err(|e| handle_auth_error(url, &e))
+                builder
+                    .clone(url, path)
+                    .map_err(|e| handle_auth_error(url, &e))
             } else {
                 clone_result.map_err(|e| handle_auth_error(url, &e))
             }
@@ -711,29 +793,26 @@ fn clone_repository(
         }
     } else {
         clone_pb.finish_with_message("✗ Invalid URL format");
-        Err(
-            anyhow::anyhow!(
-                "Invalid repository URL format: {}\n\
+        Err(anyhow::anyhow!(
+            "Invalid repository URL format: {}\n\
             URL must start with 'https://' or 'git@'",
-                url
-            )
-        )
+            url
+        ))
     };
 
     // Update progress bar based on result
     match &result {
         Ok(_) => {
             if url.starts_with("git@") {
-                clone_pb.finish_with_message(
-                    format!(
-                        "✓ SSH connection established and repository cloned in {:.1}s",
-                        clone_pb.elapsed().as_secs_f64()
-                    )
-                );
+                clone_pb.finish_with_message(format!(
+                    "✓ SSH connection established and repository cloned in {:.1}s",
+                    clone_pb.elapsed().as_secs_f64()
+                ));
             } else {
-                clone_pb.finish_with_message(
-                    format!("✓ Repository cloned in {:.1}s", clone_pb.elapsed().as_secs_f64())
-                );
+                clone_pb.finish_with_message(format!(
+                    "✓ Repository cloned in {:.1}s",
+                    clone_pb.elapsed().as_secs_f64()
+                ));
             }
         }
         Err(_) => {
@@ -751,7 +830,7 @@ fn process_repository(
     args: &Args,
     copy_mode: bool,
     allow_commit: bool,
-    multi_progress: Arc<MultiProgress>
+    multi_progress: Arc<MultiProgress>,
 ) -> Result<()> {
     let clone_start = Instant::now();
 
@@ -763,8 +842,7 @@ fn process_repository(
         PathBuf::from(path)
     } else if args.open_cursor {
         // Use cache directory for cursor mode if no specific path provided
-        let cache_dir = dirs
-            ::cache_dir()
+        let cache_dir = dirs::cache_dir()
             .ok_or_else(|| anyhow::anyhow!("Could not determine cache directory"))?
             .join("repod");
         fs::create_dir_all(&cache_dir)?;
@@ -778,14 +856,16 @@ fn process_repository(
         // If directory exists and is not empty, remove it first
         if repo_dir.exists() {
             if repo_dir.read_dir()?.next().is_some() {
-                println!("Directory exists and is not empty, removing: {}", repo_dir.display());
+                println!(
+                    "Directory exists and is not empty, removing: {}",
+                    repo_dir.display()
+                );
                 fs::remove_dir_all(&repo_dir)?;
             }
         }
 
-        let _repo = clone_repository(url, &repo_dir, args, &multi_progress).with_context(||
-            format!("Failed to access repository: {}", url)
-        )?;
+        let _repo = clone_repository(url, &repo_dir, args, &multi_progress)
+            .with_context(|| format!("Failed to access repository: {}", url))?;
 
         {
             let mut stats_guard = stats.lock();
@@ -801,9 +881,19 @@ fn process_repository(
         if args.multi_commit && args.commit {
             print_warn("Both --commit and --multi-commit provided; choose one. Skipping commit.");
         } else if args.multi_commit {
-            commit_with_ai_multi(&repo_dir, &multi_progress, args.branch.as_deref(), args.push)?;
+            commit_with_ai_multi(
+                &repo_dir,
+                &multi_progress,
+                args.branch.as_deref(),
+                args.push,
+            )?;
         } else if args.commit {
-            commit_with_ai_single(&repo_dir, &multi_progress, args.branch.as_deref(), args.push)?;
+            commit_with_ai_single(
+                &repo_dir,
+                &multi_progress,
+                args.branch.as_deref(),
+                args.push,
+            )?;
         }
         return Ok(());
     }
@@ -815,7 +905,11 @@ fn process_repository(
 
     // First, check for README file in root
     let scan_pb = multi_progress.add(ProgressBar::new_spinner());
-    scan_pb.set_style(ProgressStyle::default_spinner().template("{spinner:.blue} {msg}").unwrap());
+    scan_pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.blue} {msg}")
+            .unwrap(),
+    );
     scan_pb.enable_steady_tick(std::time::Duration::from_millis(100));
     scan_pb.set_message("Scanning repository structure...");
 
@@ -823,14 +917,22 @@ fn process_repository(
     // Build only-set matcher once for this repo
     let only_set = build_only_globset(&args.only, &args.only_dirs);
 
-    for readme_name in ["README.md", "README.txt", "README", "Readme.md", "readme.md"] {
+    for readme_name in [
+        "README.md",
+        "README.txt",
+        "README",
+        "Readme.md",
+        "readme.md",
+    ] {
         let readme_path = repo_dir.join(readme_name);
         if readme_path.exists() && readme_path.is_file() {
             // Respect only globs (including only-dir)
             if let Some(ref set) = only_set {
-                if !set.is_match(readme_name) { continue; }
+                if !set.is_match(readme_name) {
+                    continue;
+                }
             }
-            
+
             if let Ok(content) = read_file_content(&readme_path) {
                 let token_count = tokenizer.encode_ordinary(&content).len();
                 let metadata_block = build_metadata_block(readme_name);
@@ -846,21 +948,17 @@ fn process_repository(
         }
     }
 
-    // Build combined list of excluded patterns (built‑in + user‑supplied)
-    let excluded_patterns: Vec<&str> = EXCLUDED_PATTERNS.iter()
-        .copied()
-        .chain(args.exclude.iter().map(|s| s.as_str()))
-        .collect();
+    // Build combined exclude matcher (built‑in + user‑supplied)
+    let exclude_set = build_exclude_globset(EXCLUDED_PATTERNS, &args.exclude);
 
     // Build the walker with ignore support
     let mut walker_builder = WalkBuilder::new(&repo_dir);
-    
+
     // Configure the walker
     // For cloned repos, we disable git-specific ignores to ensure consistent behavior
     // regardless of how the repo was obtained (cloned vs downloaded)
     let is_cloned_repo = url != ".";
-    
-    
+
     walker_builder
         .hidden(false) // We'll handle hidden files with our own logic
         .git_ignore(true) // Always respect .gitignore files in the repo
@@ -868,22 +966,21 @@ fn process_repository(
         .git_exclude(!is_cloned_repo) // Only respect .git/info/exclude for local repos
         .ignore(true) // Respect .ignore files
         .parents(!is_cloned_repo); // Only respect parent ignore files for local repos
-    
-    // Add custom ignore patterns
-    for pattern in &excluded_patterns {
-        walker_builder.add_custom_ignore_filename(format!(".{}", pattern));
-    }
 
     // Count total files first for progress bar
-    let total_files: usize = walker_builder.build()
+    let total_files: usize = walker_builder
+        .build()
         .filter_map(Result::ok)
         .filter(|entry| {
             let path = entry.path();
-            let path_str = normalize_full_path(path);
-            
-            // Check our built-in exclusions
-            let is_excluded = excluded_patterns.iter().any(|pattern| path_str.contains(pattern));
-            
+            let rel = normalize_rel_path(path, &repo_dir);
+
+            // Check our built-in + user exclusions (repo-relative)
+            let is_excluded = exclude_set
+                .as_ref()
+                .map(|set| set.is_match(&rel))
+                .unwrap_or(false);
+
             // Check if it's a hidden file/folder (starts with .)
             // Only check path components RELATIVE to the repo_dir to avoid issues with temp directories
             let is_hidden = if let Ok(relative_path) = path.strip_prefix(&repo_dir) {
@@ -900,13 +997,16 @@ fn process_repository(
                     .map(|name| name.to_string_lossy().starts_with('.'))
                     .unwrap_or(false)
             };
-            
+
             let is_file = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false);
 
-            if !(is_file && !is_excluded && !is_hidden) { return false; }
+            if !(is_file && !is_excluded && !is_hidden) {
+                return false;
+            }
             if let Some(ref set) = only_set {
-                let rel = normalize_rel_path(path, &repo_dir);
-                if !set.is_match(rel) { return false; }
+                if !set.is_match(&rel) {
+                    return false;
+                }
             }
 
             true
@@ -921,20 +1021,24 @@ fn process_repository(
         ProgressStyle::default_bar()
             .template("{spinner:.green} [{bar:40.cyan/blue}] {pos}/{len} files ({eta})")
             .unwrap()
-            .progress_chars("#>-")
+            .progress_chars("#>-"),
     );
     process_pb.enable_steady_tick(std::time::Duration::from_millis(100));
 
     // Collect and process other files in parallel
-    let files: Vec<_> = walker_builder.build()
+    let files: Vec<_> = walker_builder
+        .build()
         .filter_map(Result::ok)
         .filter(|entry| {
             let path = entry.path();
-            let path_str = normalize_full_path(path);
-            
-            // Check our built-in exclusions
-            let is_excluded = excluded_patterns.iter().any(|pattern| path_str.contains(pattern));
-            
+            let rel = normalize_rel_path(path, &repo_dir);
+
+            // Check our built-in + user exclusions (repo-relative)
+            let is_excluded = exclude_set
+                .as_ref()
+                .map(|set| set.is_match(&rel))
+                .unwrap_or(false);
+
             // Check if it's a hidden file/folder (starts with .)
             // Only check path components RELATIVE to the repo_dir to avoid issues with temp directories
             let is_hidden = if let Ok(relative_path) = path.strip_prefix(&repo_dir) {
@@ -951,12 +1055,17 @@ fn process_repository(
                     .map(|name| name.to_string_lossy().starts_with('.'))
                     .unwrap_or(false)
             };
-            
-            let ok = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) && !is_excluded && !is_hidden;
-            if !ok { return false; }
+
+            let ok = entry.file_type().map(|ft| ft.is_file()).unwrap_or(false)
+                && !is_excluded
+                && !is_hidden;
+            if !ok {
+                return false;
+            }
             if let Some(ref set) = only_set {
-                let rel = normalize_rel_path(path, &repo_dir);
-                if !set.is_match(rel) { return false; }
+                if !set.is_match(&rel) {
+                    return false;
+                }
             }
             true
         })
@@ -974,8 +1083,13 @@ fn process_repository(
             let should_process = should_process_file(
                 path,
                 &repo_dir,
-                if args.repo_types.is_empty() { None } else { Some(&args.repo_types) },
-                only_set.as_ref()
+                if args.repo_types.is_empty() {
+                    None
+                } else {
+                    Some(&args.repo_types)
+                },
+                only_set.as_ref(),
+                exclude_set.as_ref(),
             );
             let is_binary = matches!(is_binary_file(path), Ok(true));
 
@@ -987,27 +1101,25 @@ fn process_repository(
                 return None;
             }
 
-            read_file_content(path)
-                .ok()
-                .map(|content| {
-                    let relative_path = path.strip_prefix(&repo_dir).unwrap().display().to_string();
-                    let token_count = tokenizer.encode_ordinary(&content).len();
-                    let metadata_block = build_metadata_block(&relative_path);
-                    let metadata_token_count = tokenizer.encode_ordinary(&metadata_block).len();
-                    FileContent {
-                        path: relative_path,
-                        content,
-                        token_count,
-                        metadata_token_count,
-                    }
-                })
+            read_file_content(path).ok().map(|content| {
+                let relative_path = path.strip_prefix(&repo_dir).unwrap().display().to_string();
+                let token_count = tokenizer.encode_ordinary(&content).len();
+                let metadata_block = build_metadata_block(&relative_path);
+                let metadata_token_count = tokenizer.encode_ordinary(&metadata_block).len();
+                FileContent {
+                    path: relative_path,
+                    content,
+                    token_count,
+                    metadata_token_count,
+                }
+            })
         })
         .collect();
 
     process_pb.finish_with_message(format!("Processed {} files", files.len()));
 
     // Prepare directory tree output for later writing and token accounting
-    let tree = DirectoryTree::build(&repo_dir, &excluded_patterns, &args.only, &args.only_dirs)?;
+    let tree = DirectoryTree::build(&repo_dir, exclude_set.as_ref(), &args.only, &args.only_dirs)?;
     let directory_block = format!(
         "<directory_structure>\n{}\n</directory_structure>\n\n",
         tree.format()
@@ -1044,7 +1156,9 @@ fn process_repository(
     // Write progress
     let write_pb = multi_progress.add(ProgressBar::new_spinner());
     write_pb.set_style(
-        ProgressStyle::default_spinner().template("{spinner:.green} {msg}").unwrap()
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg}")
+            .unwrap(),
     );
     write_pb.enable_steady_tick(std::time::Duration::from_millis(100));
     write_pb.set_message("Writing output");
@@ -1069,11 +1183,9 @@ fn process_repository(
     if copy_mode {
         // Copy to clipboard
         let content = String::from_utf8(output_buffer)?;
-        let mut ctx = ClipboardContext::new().map_err(|e|
-            anyhow::anyhow!("Failed to access clipboard: {}", e)
-        )?;
-        ctx
-            .set_contents(content)
+        let mut ctx = ClipboardContext::new()
+            .map_err(|e| anyhow::anyhow!("Failed to access clipboard: {}", e))?;
+        ctx.set_contents(content)
             .map_err(|e| anyhow::anyhow!("Failed to copy to clipboard: {}", e))?;
         println!("Content copied to clipboard");
     } else {
@@ -1106,7 +1218,11 @@ fn process_repository(
     // If cursor mode is enabled, run the cursor command
     if args.open_cursor {
         let cursor_cmd = format!("cursor {}", repo_dir.display());
-        if let Err(e) = std::process::Command::new("sh").arg("-c").arg(&cursor_cmd).spawn() {
+        if let Err(e) = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(&cursor_cmd)
+            .spawn()
+        {
             println!("Failed to open Cursor: {}", e);
         }
     }
@@ -1118,7 +1234,12 @@ fn process_repository(
 
 // (old commit_with_ai_message/commit_with_ai_choice removed)
 
-fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress, branch_spec: Option<&str>, do_push: bool) -> Result<()> {
+fn commit_with_ai_single(
+    repo_dir: &Path,
+    multi_progress: &MultiProgress,
+    branch_spec: Option<&str>,
+    do_push: bool,
+) -> Result<()> {
     if !repo_dir.join(".git").exists() {
         print_warn(&format!("Not a git repository: {}", repo_dir.display()));
         return Ok(());
@@ -1132,7 +1253,11 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress, branch
     }
 
     let pb = multi_progress.add(ProgressBar::new_spinner());
-    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap(),
+    );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("Generating single-commit proposal...");
     let diff_base = diff_base_ref(repo_dir);
@@ -1141,13 +1266,19 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress, branch
     let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", diff_base])?;
     let changes_box = build_changes_summary_box(&numstat, &shortstat, 50);
     print_boxed("Changes", &changes_box);
-    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", diff_base])?, 20_000);
+    let diff_sample = truncate(
+        &run_in_repo(repo_dir, &["git", "diff", "-U3", diff_base])?,
+        20_000,
+    );
     let prompt = build_commit_prompt_multiline(&name_status, &shortstat, &diff_sample);
     let msg = match generate_commit_message_via_gemini(&prompt) {
         Ok(m) => m,
         Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
     };
-    pb.finish_with_message(format!("{}", "Single-commit proposal ready".to_string().green().bold()));
+    pb.finish_with_message(format!(
+        "{}",
+        "Single-commit proposal ready".to_string().green().bold()
+    ));
 
     // Show message and confirm
     print_boxed("Proposed Commit", &msg);
@@ -1157,24 +1288,31 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress, branch
     }
 
     // Stage and commit
-    run_in_repo(repo_dir, &["git", "add", "-A"]) ?;
+    run_in_repo(repo_dir, &["git", "add", "-A"])?;
     if let Some((subject, body)) = split_subject_body(&msg) {
         if body.trim().is_empty() {
             run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim()])?;
         } else {
-            run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim(), "-m", body.trim()])?;
+            run_in_repo(
+                repo_dir,
+                &["git", "commit", "-m", subject.trim(), "-m", body.trim()],
+            )?;
         }
     } else {
         run_in_repo(repo_dir, &["git", "commit", "-m", msg.trim()])?;
     }
     print_success(&format!("Committed to {}.", current_branch));
 
-    if do_push { try_push(repo_dir, &current_branch)?; }
+    if do_push {
+        try_push(repo_dir, &current_branch)?;
+    }
 
     let leftovers = list_changed_files_vs_head(repo_dir)?;
     if !leftovers.is_empty() {
         print_warn(&format!("Leftover uncommitted files: {}", leftovers.len()));
-        for f in &leftovers { println!("  • {}", f); }
+        for f in &leftovers {
+            println!("  • {}", f);
+        }
         if prompt_yes_no_keypress("› Generate AI commit for leftovers? [y/N] ")? {
             commit_files_with_ai(repo_dir, &leftovers, multi_progress)?;
             print_success("Leftover files committed.");
@@ -1183,7 +1321,12 @@ fn commit_with_ai_single(repo_dir: &Path, multi_progress: &MultiProgress, branch
     Ok(())
 }
 
-fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_spec: Option<&str>, do_push: bool) -> Result<()> {
+fn commit_with_ai_multi(
+    repo_dir: &Path,
+    multi_progress: &MultiProgress,
+    branch_spec: Option<&str>,
+    do_push: bool,
+) -> Result<()> {
     if !repo_dir.join(".git").exists() {
         print_warn(&format!("Not a git repository: {}", repo_dir.display()));
         return Ok(());
@@ -1197,7 +1340,11 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_
     }
 
     let pb = multi_progress.add(ProgressBar::new_spinner());
-    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap(),
+    );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("Analyzing multi-commit plan...");
     let (commits, leftovers) = plan_multi_commits(repo_dir, multi_progress)?;
@@ -1206,41 +1353,85 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_
     let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", diff_base])?;
     let changes_box = build_changes_summary_box(&numstat, &shortstat, 50);
     print_boxed("Changes", &changes_box);
-    pb.finish_with_message(format!("{}", "Multi-commit analysis complete".to_string().green().bold()));
+    pb.finish_with_message(format!(
+        "{}",
+        "Multi-commit analysis complete".to_string().green().bold()
+    ));
 
     println!("Proposed multi-commit plan:\n");
     for (i, c) in commits.iter().enumerate() {
         println!("{}. {}", i + 1, c.title);
-        if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
+        if let Some(body) = &c.body {
+            if !body.trim().is_empty() {
+                println!("\n{}\n", body.trim());
+            }
+        }
         println!("Files ({}):", c.files.len());
-        for f in &c.files { println!("  - {}", f); }
+        for f in &c.files {
+            println!("  - {}", f);
+        }
         println!("");
 
         // Per-commit change summary (shortstat + numstat scoped to these files)
-        let mut shortstat_args = vec!["git".to_string(), "diff".to_string(), "--shortstat".to_string(), diff_base.to_string(), "--".to_string()];
-        let mut numstat_args = vec!["git".to_string(), "diff".to_string(), "--numstat".to_string(), diff_base.to_string(), "--".to_string()];
-        for f in &c.files { shortstat_args.push(f.clone()); numstat_args.push(f.clone()); }
+        let mut shortstat_args = vec![
+            "git".to_string(),
+            "diff".to_string(),
+            "--shortstat".to_string(),
+            diff_base.to_string(),
+            "--".to_string(),
+        ];
+        let mut numstat_args = vec![
+            "git".to_string(),
+            "diff".to_string(),
+            "--numstat".to_string(),
+            diff_base.to_string(),
+            "--".to_string(),
+        ];
+        for f in &c.files {
+            shortstat_args.push(f.clone());
+            numstat_args.push(f.clone());
+        }
         if let Ok(shortstat_scoped) = run_in_repo_strings(repo_dir, shortstat_args) {
             if let Ok(numstat_scoped) = run_in_repo_strings(repo_dir, numstat_args) {
                 let box_text = build_changes_summary_box(&numstat_scoped, &shortstat_scoped, 50);
-                if !box_text.trim().is_empty() { print_boxed("Changes", &box_text); }
+                if !box_text.trim().is_empty() {
+                    print_boxed("Changes", &box_text);
+                }
             }
         }
     }
     if !leftovers.is_empty() {
-        print_warn(&format!("Leftover files not in any commit: {}", leftovers.len()));
-        for f in &leftovers { println!("  • {}", f); }
+        print_warn(&format!(
+            "Leftover files not in any commit: {}",
+            leftovers.len()
+        ));
+        for f in &leftovers {
+            println!("  • {}", f);
+        }
         println!("");
     }
     // Confirm and apply each commit individually
     for (i, c) in commits.iter().enumerate() {
         println!("Apply commit {}/{}: {}", i + 1, commits.len(), c.title);
-        if let Some(body) = &c.body { if !body.trim().is_empty() { println!("\n{}\n", body.trim()); } }
+        if let Some(body) = &c.body {
+            if !body.trim().is_empty() {
+                println!("\n{}\n", body.trim());
+            }
+        }
         println!("Files ({}):", c.files.len());
-        for f in &c.files { println!("  - {}", f); }
+        for f in &c.files {
+            println!("  - {}", f);
+        }
         if prompt_yes_no_keypress("Commit this change? [y/N] ")? {
-            let mut add_args = vec!["git".to_string(), "add".to_string(), "-A".to_string(), "--".to_string()];
-            for f in &c.files { add_args.push(f.clone()); }
+            let mut add_args = vec![
+                "git".to_string(),
+                "add".to_string(),
+                "-A".to_string(),
+                "--".to_string(),
+            ];
+            for f in &c.files {
+                add_args.push(f.clone());
+            }
             run_in_repo_strings(repo_dir, add_args)?;
 
             let subject = c.title.trim().to_string();
@@ -1257,20 +1448,29 @@ fn commit_with_ai_multi(repo_dir: &Path, multi_progress: &MultiProgress, branch_
 
     let post_leftovers = list_changed_files_vs_head(repo_dir)?;
     if !post_leftovers.is_empty() {
-        print_warn(&format!("Leftover uncommitted files: {}", post_leftovers.len()));
-        for f in &post_leftovers { println!("  • {}", f); }
+        print_warn(&format!(
+            "Leftover uncommitted files: {}",
+            post_leftovers.len()
+        ));
+        for f in &post_leftovers {
+            println!("  • {}", f);
+        }
         if prompt_yes_no_keypress("› Generate AI commit for leftovers? [y/N] ")? {
             commit_files_with_ai(repo_dir, &post_leftovers, multi_progress)?;
             print_success("Leftover files committed.");
         }
     }
-    if do_push { try_push(repo_dir, &current_branch)?; }
+    if do_push {
+        try_push(repo_dir, &current_branch)?;
+    }
     print_success("Multi-commit completed.");
     Ok(())
 }
 
 fn run_in_repo(repo_dir: &Path, args: &[&str]) -> Result<String> {
-    let (cmd, rest) = args.split_first().ok_or_else(|| anyhow::anyhow!("empty command"))?;
+    let (cmd, rest) = args
+        .split_first()
+        .ok_or_else(|| anyhow::anyhow!("empty command"))?;
     let output = Command::new(cmd)
         .args(rest)
         .current_dir(repo_dir)
@@ -1282,7 +1482,8 @@ fn run_in_repo(repo_dir: &Path, args: &[&str]) -> Result<String> {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         Err(anyhow::anyhow!(
             "command {:?} failed: {}",
-            args, stderr.trim()
+            args,
+            stderr.trim()
         ))
     }
 }
@@ -1297,7 +1498,11 @@ fn git_has_head(repo_dir: &Path) -> bool {
 }
 
 fn diff_base_ref(repo_dir: &Path) -> &'static str {
-    if git_has_head(repo_dir) { "HEAD" } else { EMPTY_TREE_HASH }
+    if git_has_head(repo_dir) {
+        "HEAD"
+    } else {
+        EMPTY_TREE_HASH
+    }
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1329,12 +1534,24 @@ fn prompt_yes_no_keypress(prompt: &str) -> Result<bool> {
                 KeyCode::Char(c) => {
                     let cl = c.to_ascii_lowercase();
                     match cl {
-                        'y' => { print!("{}\n", c); std::io::stdout().flush().ok(); break Ok(true); }
-                        'n' => { print!("{}\n", c); std::io::stdout().flush().ok(); break Ok(false); }
+                        'y' => {
+                            print!("{}\n", c);
+                            std::io::stdout().flush().ok();
+                            break Ok(true);
+                        }
+                        'n' => {
+                            print!("{}\n", c);
+                            std::io::stdout().flush().ok();
+                            break Ok(false);
+                        }
                         _ => {}
                     }
                 }
-                KeyCode::Esc => { print!("\n"); std::io::stdout().flush().ok(); break Ok(false); }
+                KeyCode::Esc => {
+                    print!("\n");
+                    std::io::stdout().flush().ok();
+                    break Ok(false);
+                }
                 _ => {}
             },
             Ok(_) => {}
@@ -1386,7 +1603,9 @@ fn read_line_prompt(prompt: &str) -> Result<String> {
     print!("{}", prompt);
     io::stdout().flush().ok();
     let mut input = String::new();
-    io::stdin().read_line(&mut input).map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
+    io::stdin()
+        .read_line(&mut input)
+        .map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
     Ok(input.trim().to_string())
 }
 
@@ -1419,8 +1638,15 @@ fn fallback_commit_message_multiline(name_status: &str, shortstat: &str) -> Stri
         .collect();
     let files_str = files.join(", ");
     let stat = shortstat.trim();
-    let subject = if files_str.is_empty() { "chore: update files".to_string() } else { truncate(&format!("chore: update {}", files_str), 72) };
-    let body = format!("\n\n- Update files\n- Summary: {}", if stat.is_empty() { "n/a" } else { stat });
+    let subject = if files_str.is_empty() {
+        "chore: update files".to_string()
+    } else {
+        truncate(&format!("chore: update {}", files_str), 72)
+    };
+    let body = format!(
+        "\n\n- Update files\n- Summary: {}",
+        if stat.is_empty() { "n/a" } else { stat }
+    );
     format!("{}{}", subject, body)
 }
 
@@ -1439,11 +1665,13 @@ struct GeminiContent<'a> {
 }
 
 #[derive(Serialize)]
-struct GeminiPart<'a> { text: &'a str }
+struct GeminiPart<'a> {
+    text: &'a str,
+}
 
 #[derive(Deserialize)]
 struct GeminiResponse {
-    candidates: Option<Vec<GeminiCandidate>>,    
+    candidates: Option<Vec<GeminiCandidate>>,
 }
 
 #[derive(Deserialize)]
@@ -1453,7 +1681,7 @@ struct GeminiCandidate {
 
 #[derive(Deserialize)]
 struct GeminiGeneratedContent {
-    parts: Option<Vec<GeminiGeneratedPart>>,   
+    parts: Option<Vec<GeminiGeneratedPart>>,
 }
 
 #[derive(Deserialize)]
@@ -1492,19 +1720,29 @@ struct GeminiToolConfig<'a> {
 #[derive(Serialize)]
 struct GeminiFunctionCallingConfig<'a> {
     mode: &'a str,
-    #[serde(rename = "allowedFunctionNames", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        rename = "allowedFunctionNames",
+        skip_serializing_if = "Option::is_none"
+    )]
     allowed_function_names: Option<Vec<&'a str>>,
 }
 
 fn generate_commit_message_via_gemini(prompt: &str) -> Result<String> {
-    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    let api_key =
+        std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
     let model = "gemini-2.5-flash"; // updated model
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
         model, api_key
     );
 
-    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: prompt }] }], tools: None, tool_config: None };
+    let req = GeminiRequest {
+        contents: vec![GeminiContent {
+            parts: vec![GeminiPart { text: prompt }],
+        }],
+        tools: None,
+        tool_config: None,
+    };
     let resp: GeminiResponse = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_json(serde_json::to_value(&req)?)
@@ -1522,7 +1760,11 @@ fn generate_commit_message_via_gemini(prompt: &str) -> Result<String> {
         .unwrap_or_default()
         .trim()
         .to_string();
-    if text.is_empty() { anyhow::bail!("empty response from model") } else { Ok(text) }
+    if text.is_empty() {
+        anyhow::bail!("empty response from model")
+    } else {
+        Ok(text)
+    }
 }
 
 // -------- Multi-commit planning --------
@@ -1539,7 +1781,10 @@ struct CommitPlan {
     files: Vec<String>,
 }
 
-fn plan_multi_commits(repo_dir: &Path, _multi_progress: &MultiProgress) -> Result<(Vec<CommitPlan>, Vec<String>)> {
+fn plan_multi_commits(
+    repo_dir: &Path,
+    _multi_progress: &MultiProgress,
+) -> Result<(Vec<CommitPlan>, Vec<String>)> {
     // Ensure repo and changes
     if !repo_dir.join(".git").exists() {
         anyhow::bail!("Not a git repository: {}", repo_dir.display());
@@ -1554,7 +1799,10 @@ fn plan_multi_commits(repo_dir: &Path, _multi_progress: &MultiProgress) -> Resul
     let name_status = run_in_repo(repo_dir, &["git", "diff", "--name-status", diff_base])?;
     let numstat = run_in_repo(repo_dir, &["git", "diff", "--numstat", diff_base])?;
     let shortstat = run_in_repo(repo_dir, &["git", "diff", "--shortstat", diff_base])?;
-    let diff_sample = truncate(&run_in_repo(repo_dir, &["git", "diff", "-U3", diff_base])?, 40_000);
+    let diff_sample = truncate(
+        &run_in_repo(repo_dir, &["git", "diff", "-U3", diff_base])?,
+        40_000,
+    );
 
     let plan_prompt = build_multi_commit_prompt(&name_status, &numstat, &shortstat, &diff_sample);
     let plan = match generate_commit_plan_via_gemini(&plan_prompt) {
@@ -1586,7 +1834,11 @@ fn plan_multi_commits(repo_dir: &Path, _multi_progress: &MultiProgress) -> Resul
 
     // Determine leftovers
     let mut included = std::collections::HashSet::new();
-    for c in &normalized { for f in &c.files { included.insert(f.clone()); } }
+    for c in &normalized {
+        for f in &c.files {
+            included.insert(f.clone());
+        }
+    }
     let leftovers: Vec<String> = changed_files
         .into_iter()
         .filter(|f| !included.contains(f))
@@ -1597,7 +1849,12 @@ fn plan_multi_commits(repo_dir: &Path, _multi_progress: &MultiProgress) -> Resul
 
 // (old do_commits removed)
 
-fn build_multi_commit_prompt(name_status: &str, numstat: &str, shortstat: &str, diff_sample: &str) -> String {
+fn build_multi_commit_prompt(
+    name_status: &str,
+    numstat: &str,
+    shortstat: &str,
+    diff_sample: &str,
+) -> String {
     format!(
         "Analyze the following changes and propose a set of logical commits.\n\
         Output STRICT JSON with this schema: {{\"commits\":[{{\"title\":string,\"body\":string,\"files\":[string]}}]}}.\n\
@@ -1616,7 +1873,8 @@ fn build_multi_commit_prompt(name_status: &str, numstat: &str, shortstat: &str, 
 }
 
 fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
-    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    let api_key =
+        std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
     let model = "gemini-2.5-flash";
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
@@ -1644,11 +1902,14 @@ fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
     });
 
     let req = GeminiRequest {
-        contents: vec![GeminiContent { parts: vec![GeminiPart { text: prompt }] }],
+        contents: vec![GeminiContent {
+            parts: vec![GeminiPart { text: prompt }],
+        }],
         tools: Some(vec![GeminiTool {
             function_declarations: vec![GeminiFunctionDeclaration {
                 name: "propose_commit_plan",
-                description: "Propose a logical multi-commit plan for the provided repository changes.",
+                description:
+                    "Propose a logical multi-commit plan for the provided repository changes.",
                 parameters: params_schema,
             }],
         }]),
@@ -1670,39 +1931,52 @@ fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
     // Prefer tool-calling path: extract function call arguments
     let candidates = resp.candidates.unwrap_or_default();
     for cand in &candidates {
-            if let Some(content) = &cand.content {
-                if let Some(parts) = &content.parts {
-                    for part in parts {
-                        if let Some(fc) = &part.function_call {
-                            // Accept only our declared function
-                            if fc.name == "propose_commit_plan" {
-                                // args might be a struct or a JSON string – handle both
-                                let plan_res: Result<CommitPlanResponse> = match &fc.args {
-                                    serde_json::Value::String(s) => {
-                                        if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(s) {
-                                            Ok(plan)
-                                        } else if let Ok(commits) = serde_json::from_str::<Vec<CommitPlan>>(s) {
-                                            Ok(CommitPlanResponse { commits })
-                                        } else {
-                                            Err(anyhow::anyhow!("functionCall args string not valid plan JSON"))
-                                        }
+        if let Some(content) = &cand.content {
+            if let Some(parts) = &content.parts {
+                for part in parts {
+                    if let Some(fc) = &part.function_call {
+                        // Accept only our declared function
+                        if fc.name == "propose_commit_plan" {
+                            // args might be a struct or a JSON string – handle both
+                            let plan_res: Result<CommitPlanResponse> = match &fc.args {
+                                serde_json::Value::String(s) => {
+                                    if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(s)
+                                    {
+                                        Ok(plan)
+                                    } else if let Ok(commits) =
+                                        serde_json::from_str::<Vec<CommitPlan>>(s)
+                                    {
+                                        Ok(CommitPlanResponse { commits })
+                                    } else {
+                                        Err(anyhow::anyhow!(
+                                            "functionCall args string not valid plan JSON"
+                                        ))
                                     }
-                                    v => {
-                                        if let Ok(plan) = serde_json::from_value::<CommitPlanResponse>(v.clone()) {
-                                            Ok(plan)
-                                        } else if let Ok(commits) = serde_json::from_value::<Vec<CommitPlan>>(v.clone()) {
-                                            Ok(CommitPlanResponse { commits })
-                                        } else {
-                                            Err(anyhow::anyhow!("functionCall args not valid plan JSON"))
-                                        }
+                                }
+                                v => {
+                                    if let Ok(plan) =
+                                        serde_json::from_value::<CommitPlanResponse>(v.clone())
+                                    {
+                                        Ok(plan)
+                                    } else if let Ok(commits) =
+                                        serde_json::from_value::<Vec<CommitPlan>>(v.clone())
+                                    {
+                                        Ok(CommitPlanResponse { commits })
+                                    } else {
+                                        Err(anyhow::anyhow!(
+                                            "functionCall args not valid plan JSON"
+                                        ))
                                     }
-                                };
-                                if let Ok(plan) = plan_res { return Ok(plan); }
+                                }
+                            };
+                            if let Ok(plan) = plan_res {
+                                return Ok(plan);
                             }
                         }
                     }
                 }
             }
+        }
     }
 
     // Fallback: parse any text output as before (robust JSON extraction)
@@ -1711,7 +1985,9 @@ fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
         if let Some(content) = cand.content {
             if let Some(parts) = content.parts {
                 for part in parts {
-                    if let Some(t) = part.text { last_text = Some(t); }
+                    if let Some(t) = part.text {
+                        last_text = Some(t);
+                    }
                 }
             }
         }
@@ -1719,59 +1995,107 @@ fn generate_commit_plan_via_gemini(prompt: &str) -> Result<CommitPlanResponse> {
 
     fn extract_json_candidate(s: &str) -> Option<String> {
         let t = s.trim();
-        if t.is_empty() { return None; }
+        if t.is_empty() {
+            return None;
+        }
         if let Some(start) = t.find("```") {
             let after = &t[start + 3..];
-            let after = after.strip_prefix("json").or_else(|| after.strip_prefix("JSON")).unwrap_or(after);
+            let after = after
+                .strip_prefix("json")
+                .or_else(|| after.strip_prefix("JSON"))
+                .unwrap_or(after);
             let after = after.strip_prefix('\n').unwrap_or(after);
             if let Some(end_rel) = after.find("```") {
                 let block = &after[..end_rel];
                 let block_trim = block.trim();
-                if block_trim.starts_with('{') || block_trim.starts_with('[') { return Some(block_trim.to_string()); }
+                if block_trim.starts_with('{') || block_trim.starts_with('[') {
+                    return Some(block_trim.to_string());
+                }
             }
         }
-        let mut depth = 0usize; let mut start_idx: Option<usize> = None;
+        let mut depth = 0usize;
+        let mut start_idx: Option<usize> = None;
         for (i, ch) in t.char_indices() {
             match ch {
-                '{' => { if depth == 0 { start_idx = Some(i); } depth += 1; }
+                '{' => {
+                    if depth == 0 {
+                        start_idx = Some(i);
+                    }
+                    depth += 1;
+                }
                 '}' => {
-                    if depth > 0 { depth -= 1; }
-                    if depth == 0 { if let Some(s0) = start_idx { return Some(t[s0..=i].to_string()); } }
+                    if depth > 0 {
+                        depth -= 1;
+                    }
+                    if depth == 0 {
+                        if let Some(s0) = start_idx {
+                            return Some(t[s0..=i].to_string());
+                        }
+                    }
                 }
                 _ => {}
             }
         }
         // Try array scanning
-        if let Some(s0) = t.find('[') { if let Some(s1) = t.rfind(']') { if s1 > s0 { return Some(t[s0..=s1].to_string()); } } }
+        if let Some(s0) = t.find('[') {
+            if let Some(s1) = t.rfind(']') {
+                if s1 > s0 {
+                    return Some(t[s0..=s1].to_string());
+                }
+            }
+        }
         None
     }
 
-    if let Some(text) = last_text {        
+    if let Some(text) = last_text {
         let trimmed = text.trim();
-        if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(trimmed) { return Ok(plan); }
-        if let Some(candidate) = extract_json_candidate(trimmed) {
-            if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(&candidate) { return Ok(plan); }
-            if let Ok(commits) = serde_json::from_str::<Vec<CommitPlan>>(&candidate) { return Ok(CommitPlanResponse { commits }); }
+        if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(trimmed) {
+            return Ok(plan);
         }
-        if let Ok(commits) = serde_json::from_str::<Vec<CommitPlan>>(trimmed) { return Ok(CommitPlanResponse { commits }); }
+        if let Some(candidate) = extract_json_candidate(trimmed) {
+            if let Ok(plan) = serde_json::from_str::<CommitPlanResponse>(&candidate) {
+                return Ok(plan);
+            }
+            if let Ok(commits) = serde_json::from_str::<Vec<CommitPlan>>(&candidate) {
+                return Ok(CommitPlanResponse { commits });
+            }
+        }
+        if let Ok(commits) = serde_json::from_str::<Vec<CommitPlan>>(trimmed) {
+            return Ok(CommitPlanResponse { commits });
+        }
     }
     anyhow::bail!("no function call found and could not parse text output as JSON")
 }
 
 // -------------------- Ask repo (Q&A) --------------------
 
-fn ask_about_repository(repo_dir: &Path, question: &str, args: &Args, multi_progress: &MultiProgress) -> Result<()> {
+fn ask_about_repository(
+    repo_dir: &Path,
+    question: &str,
+    args: &Args,
+    multi_progress: &MultiProgress,
+) -> Result<()> {
     print_title("Ask (Repository)");
 
     // Build repository dump (tree + selected files)
     let pb = multi_progress.add(ProgressBar::new_spinner());
-    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap(),
+    );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("Preparing repository context...");
     let t0 = Instant::now();
     let (dump, stats) = build_repo_dump(repo_dir, args)?;
-    pb.finish_with_message(format!("{}", "Repository context ready".to_string().green().bold()));
-    print_info(&format!("Included files: {} | Context bytes: {}", stats.files, stats.bytes));
+    pb.finish_with_message(format!(
+        "{}",
+        "Repository context ready".to_string().green().bold()
+    ));
+    print_info(&format!(
+        "Included files: {} | Context bytes: {}",
+        stats.files, stats.bytes
+    ));
 
     if stats.files == 0 {
         print_warn("No files matched the current filters. Aborting --ask.\nHint: Adjust --only/--exclude/--only-dir or choose a different path.");
@@ -1787,7 +2111,8 @@ fn ask_about_repository(repo_dir: &Path, question: &str, args: &Args, multi_prog
         Be concise and specific; include filenames when relevant.\n\
         Question:\n{}\n\
         Repository:\n{}",
-        question.trim(), dump
+        question.trim(),
+        dump
     );
     let tokenizer = o200k_base().unwrap();
     let token_count = tokenizer.encode_with_special_tokens(&prompt_preview).len();
@@ -1798,23 +2123,34 @@ fn ask_about_repository(repo_dir: &Path, question: &str, args: &Args, multi_prog
         ));
         return Ok(());
     }
-    print_info(&format!("Prompt tokens: {} | Prep time: {:.2}s", token_count, t0.elapsed().as_secs_f64()));
+    print_info(&format!(
+        "Prompt tokens: {} | Prep time: {:.2}s",
+        token_count,
+        t0.elapsed().as_secs_f64()
+    ));
 
     print_title("Answer (streaming)");
     let stream_res = generate_repo_answer_stream_via_gemini(question, &dump);
     match stream_res {
         Ok(answer_text) => {
             if args.copy {
-                if let Ok(mut ctx) = ClipboardContext::new() { let _ = ctx.set_contents(answer_text); }
+                if let Ok(mut ctx) = ClipboardContext::new() {
+                    let _ = ctx.set_contents(answer_text);
+                }
                 print_success("Answer copied to clipboard.");
             }
         }
         Err(e) => {
-            print_warn(&format!("Streaming failed ({}). Falling back to non-streaming.", e));
+            print_warn(&format!(
+                "Streaming failed ({}). Falling back to non-streaming.",
+                e
+            ));
             let answer = generate_repo_answer_via_gemini(question, &dump)?;
             print_boxed("Answer", &answer);
             if args.copy {
-                if let Ok(mut ctx) = ClipboardContext::new() { let _ = ctx.set_contents(answer); }
+                if let Ok(mut ctx) = ClipboardContext::new() {
+                    let _ = ctx.set_contents(answer);
+                }
                 print_success("Answer copied to clipboard.");
             }
         }
@@ -1822,14 +2158,14 @@ fn ask_about_repository(repo_dir: &Path, question: &str, args: &Args, multi_prog
     Ok(())
 }
 
-struct AskStats { files: usize, bytes: usize }
+struct AskStats {
+    files: usize,
+    bytes: usize,
+}
 
 fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
-    // Build combined excluded patterns
-    let excluded_patterns: Vec<&str> = EXCLUDED_PATTERNS.iter()
-        .copied()
-        .chain(args.exclude.iter().map(|s| s.as_str()))
-        .collect();
+    // Build combined excluded matcher
+    let exclude_set = build_exclude_globset(EXCLUDED_PATTERNS, &args.exclude);
 
     // Build only matcher once
     let only_set = build_only_globset(&args.only, &args.only_dirs);
@@ -1838,16 +2174,26 @@ fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
     let mut output = String::new();
     let mut files_included = 0usize;
     output.push_str("<directory_structure>\n");
-    let tree = DirectoryTree::build(repo_dir, &excluded_patterns, &args.only, &args.only_dirs)?;
+    let tree = DirectoryTree::build(repo_dir, exclude_set.as_ref(), &args.only, &args.only_dirs)?;
     output.push_str(&tree.format());
     output.push_str("\n</directory_structure>\n\n");
 
     // README first if exists
-    let readme_names = ["README.md", "README.txt", "README", "Readme.md", "readme.md"]; 
+    let readme_names = [
+        "README.md",
+        "README.txt",
+        "README",
+        "Readme.md",
+        "readme.md",
+    ];
     for readme_name in readme_names {
         let readme_path = repo_dir.join(readme_name);
         if readme_path.exists() && readme_path.is_file() {
-            if let Some(ref set) = only_set { if !set.is_match(readme_name) { continue; } }
+            if let Some(ref set) = only_set {
+                if !set.is_match(readme_name) {
+                    continue;
+                }
+            }
             if let Ok(content) = read_file_content(&readme_path) {
                 output.push_str("<file_info>\n");
                 output.push_str(&format!("path: {}\n", readme_name));
@@ -1873,37 +2219,66 @@ fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
 
     for result in walker_builder.build().filter_map(Result::ok) {
         let path = result.path();
-        if path == repo_dir { continue; }
-        let path_str = normalize_full_path(path);
+        if path == repo_dir {
+            continue;
+        }
+        let rel = normalize_rel_path(path, repo_dir);
         // Exclusions
-        if excluded_patterns.iter().any(|p| path_str.contains(p)) {
+        if exclude_set
+            .as_ref()
+            .map(|set| set.is_match(&rel))
+            .unwrap_or(false)
+        {
             continue;
         }
         // Hidden components
         if let Ok(rel) = path.strip_prefix(repo_dir) {
             let hidden = rel.components().any(|c| matches!(c, std::path::Component::Normal(n) if n.to_string_lossy().starts_with('.')));
-            if hidden { continue; }
+            if hidden {
+                continue;
+            }
         }
         let is_file = result.file_type().map(|ft| ft.is_file()).unwrap_or(false);
-        if !is_file { continue; }
+        if !is_file {
+            continue;
+        }
 
         // Respect only globs
         if let Some(ref set) = only_set {
-            let rels = normalize_rel_path(path, repo_dir);
-            if !set.is_match(rels) { continue; }
+            if !set.is_match(&rel) {
+                continue;
+            }
         }
 
         // Respect repo_types
-        if !should_process_file(path, repo_dir, if args.repo_types.is_empty() { None } else { Some(&args.repo_types) }, only_set.as_ref()) {
+        if !should_process_file(
+            path,
+            repo_dir,
+            if args.repo_types.is_empty() {
+                None
+            } else {
+                Some(&args.repo_types)
+            },
+            only_set.as_ref(),
+            exclude_set.as_ref(),
+        ) {
             continue;
         }
-        if matches!(is_binary_file(path), Ok(true)) { continue; }
+        if matches!(is_binary_file(path), Ok(true)) {
+            continue;
+        }
 
         if let Ok(content) = read_file_content(path) {
             let rel = path.strip_prefix(repo_dir).unwrap().display().to_string();
             output.push_str("<file_info>\n");
             output.push_str(&format!("path: {}\n", &rel));
-            output.push_str(&format!("name: {}\n", std::path::Path::new(&rel).file_name().unwrap().to_string_lossy()));
+            output.push_str(&format!(
+                "name: {}\n",
+                std::path::Path::new(&rel)
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+            ));
             output.push_str("</file_info>\n");
             output.push_str(&content);
             output.push_str("\n\n");
@@ -1912,11 +2287,18 @@ fn build_repo_dump(repo_dir: &Path, args: &Args) -> Result<(String, AskStats)> {
     }
 
     let bytes = output.len();
-    Ok((output, AskStats { files: files_included, bytes }))
+    Ok((
+        output,
+        AskStats {
+            files: files_included,
+            bytes,
+        },
+    ))
 }
 
 fn generate_repo_answer_via_gemini(question: &str, repo_dump: &str) -> Result<String> {
-    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    let api_key =
+        std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
     let model = "gemini-2.5-pro";
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:generateContent?key={}",
@@ -1929,10 +2311,17 @@ fn generate_repo_answer_via_gemini(question: &str, repo_dump: &str) -> Result<St
         Be concise and specific; include filenames when relevant.\n\
         Question:\n{}\n\
         Repository:\n{}",
-        question.trim(), repo_dump
+        question.trim(),
+        repo_dump
     );
 
-    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: &prompt }] }], tools: None, tool_config: None };
+    let req = GeminiRequest {
+        contents: vec![GeminiContent {
+            parts: vec![GeminiPart { text: &prompt }],
+        }],
+        tools: None,
+        tool_config: None,
+    };
     let resp: GeminiResponse = ureq::post(&url)
         .set("Content-Type", "application/json")
         .send_json(serde_json::to_value(&req)?)
@@ -1950,12 +2339,17 @@ fn generate_repo_answer_via_gemini(question: &str, repo_dump: &str) -> Result<St
         .unwrap_or_default()
         .trim()
         .to_string();
-    if text.is_empty() { anyhow::bail!("empty response from model") } else { Ok(text) }
+    if text.is_empty() {
+        anyhow::bail!("empty response from model")
+    } else {
+        Ok(text)
+    }
 }
 
 fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Result<String> {
     use std::io::{BufRead, BufReader};
-    let api_key = std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
+    let api_key =
+        std::env::var("GEMINI_API_KEY").map_err(|_| anyhow::anyhow!("GEMINI_API_KEY not set"))?;
     let model = "gemini-2.5-pro";
     let url = format!(
         "https://generativelanguage.googleapis.com/v1beta/models/{}:streamGenerateContent?key={}&alt=sse",
@@ -1968,10 +2362,17 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
         Be concise and specific; include filenames when relevant.\n\
         Question:\n{}\n\
         Repository:\n{}",
-        question.trim(), repo_dump
+        question.trim(),
+        repo_dump
     );
 
-    let req = GeminiRequest { contents: vec![GeminiContent { parts: vec![GeminiPart { text: &prompt }] }], tools: None, tool_config: None };
+    let req = GeminiRequest {
+        contents: vec![GeminiContent {
+            parts: vec![GeminiPart { text: &prompt }],
+        }],
+        tools: None,
+        tool_config: None,
+    };
     let resp = ureq::post(&url)
         .set("Content-Type", "application/json")
         .set("Accept", "text/event-stream")
@@ -1992,7 +2393,9 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
         line.clear();
         // SSE events end with a blank line
         if l.is_empty() {
-            if sse_event.is_empty() { continue; }
+            if sse_event.is_empty() {
+                continue;
+            }
             // Remove possible 'data: ' prefix occurrences (one per line)
             let data = sse_event
                 .lines()
@@ -2001,7 +2404,9 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
                 .join("");
             sse_event.clear();
 
-            if data.is_empty() { continue; }
+            if data.is_empty() {
+                continue;
+            }
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&data) {
                 // Extract any text
                 let mut appended = false;
@@ -2028,7 +2433,9 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
                     }
                 }
                 // Capture usage metadata if present
-                if v.get("usageMetadata").is_some() { last_usage = Some(v.clone()); }
+                if v.get("usageMetadata").is_some() {
+                    last_usage = Some(v.clone());
+                }
 
                 if appended {
                     streamed_any = true;
@@ -2045,14 +2452,22 @@ fn generate_repo_answer_stream_via_gemini(question: &str, repo_dump: &str) -> Re
         sse_event.push_str(&l);
         sse_event.push('\n');
     }
-    if !text_buf.is_empty() { stream_box_line(inner, &text_buf); }
+    if !text_buf.is_empty() {
+        stream_box_line(inner, &text_buf);
+    }
     stream_box_end(inner);
     if let Some(u) = last_usage {
-        if let Some(total) = u.get("usageMetadata").and_then(|m| m.get("totalTokenCount")).and_then(|x| x.as_i64()) {
+        if let Some(total) = u
+            .get("usageMetadata")
+            .and_then(|m| m.get("totalTokenCount"))
+            .and_then(|x| x.as_i64())
+        {
             print_info(&format!("Total tokens used: {}", total));
         }
     }
-    if !streamed_any { return Err(anyhow::anyhow!("no streamed content")); }
+    if !streamed_any {
+        return Err(anyhow::anyhow!("no streamed content"));
+    }
     Ok(full_text)
 }
 
@@ -2082,26 +2497,65 @@ fn run_in_repo_strings(repo_dir: &Path, args: Vec<String>) -> Result<String> {
         Ok(String::from_utf8_lossy(&output.stdout).to_string())
     } else {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-        Err(anyhow::anyhow!("command {:?} failed: {}", args, stderr.trim()))
+        Err(anyhow::anyhow!(
+            "command {:?} failed: {}",
+            args,
+            stderr.trim()
+        ))
     }
 }
 
-fn diff_context_for_files(repo_dir: &Path, files: &Vec<String>) -> Result<(String, String, String)> {
+fn diff_context_for_files(
+    repo_dir: &Path,
+    files: &Vec<String>,
+) -> Result<(String, String, String)> {
     let base = diff_base_ref(repo_dir);
-    let mut name_status_args = vec!["git".to_string(), "diff".to_string(), "--name-status".to_string(), base.to_string(), "--".to_string()];
-    let mut shortstat_args = vec!["git".to_string(), "diff".to_string(), "--shortstat".to_string(), base.to_string(), "--".to_string()];
-    let mut diff_args = vec!["git".to_string(), "diff".to_string(), "-U3".to_string(), base.to_string(), "--".to_string()];
-    for f in files { name_status_args.push(f.clone()); shortstat_args.push(f.clone()); diff_args.push(f.clone()); }
+    let mut name_status_args = vec![
+        "git".to_string(),
+        "diff".to_string(),
+        "--name-status".to_string(),
+        base.to_string(),
+        "--".to_string(),
+    ];
+    let mut shortstat_args = vec![
+        "git".to_string(),
+        "diff".to_string(),
+        "--shortstat".to_string(),
+        base.to_string(),
+        "--".to_string(),
+    ];
+    let mut diff_args = vec![
+        "git".to_string(),
+        "diff".to_string(),
+        "-U3".to_string(),
+        base.to_string(),
+        "--".to_string(),
+    ];
+    for f in files {
+        name_status_args.push(f.clone());
+        shortstat_args.push(f.clone());
+        diff_args.push(f.clone());
+    }
     let name_status = run_in_repo_strings(repo_dir, name_status_args)?;
     let shortstat = run_in_repo_strings(repo_dir, shortstat_args)?;
     let diff_sample = truncate(&run_in_repo_strings(repo_dir, diff_args)?, 20_000);
     Ok((name_status, shortstat, diff_sample))
 }
 
-fn commit_files_with_ai(repo_dir: &Path, files: &Vec<String>, multi_progress: &MultiProgress) -> Result<()> {
-    if files.is_empty() { return Ok(()); }
+fn commit_files_with_ai(
+    repo_dir: &Path,
+    files: &Vec<String>,
+    multi_progress: &MultiProgress,
+) -> Result<()> {
+    if files.is_empty() {
+        return Ok(());
+    }
     let pb = multi_progress.add(ProgressBar::new_spinner());
-    pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+    pb.set_style(
+        ProgressStyle::default_spinner()
+            .template("{spinner:.green} {msg} [{elapsed_precise}]")
+            .unwrap(),
+    );
     pb.enable_steady_tick(std::time::Duration::from_millis(100));
     pb.set_message("Generating commit for leftovers...");
 
@@ -2111,11 +2565,21 @@ fn commit_files_with_ai(repo_dir: &Path, files: &Vec<String>, multi_progress: &M
         Ok(m) => m,
         Err(_) => fallback_commit_message_multiline(&name_status, &shortstat),
     };
-    pb.finish_with_message(format!("{}", "Leftover commit proposal ready".to_string().green().bold()));
+    pb.finish_with_message(format!(
+        "{}",
+        "Leftover commit proposal ready".to_string().green().bold()
+    ));
 
     // Stage only these files and commit
-    let mut add_args = vec!["git".to_string(), "add".to_string(), "-A".to_string(), "--".to_string()];
-    for f in files { add_args.push(f.clone()); }
+    let mut add_args = vec![
+        "git".to_string(),
+        "add".to_string(),
+        "-A".to_string(),
+        "--".to_string(),
+    ];
+    for f in files {
+        add_args.push(f.clone());
+    }
     run_in_repo_strings(repo_dir, add_args)?;
 
     print_boxed("Leftover Commit", &msg);
@@ -2123,7 +2587,10 @@ fn commit_files_with_ai(repo_dir: &Path, files: &Vec<String>, multi_progress: &M
         if body.trim().is_empty() {
             run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim()])?;
         } else {
-            run_in_repo(repo_dir, &["git", "commit", "-m", subject.trim(), "-m", body.trim()])?;
+            run_in_repo(
+                repo_dir,
+                &["git", "commit", "-m", subject.trim(), "-m", body.trim()],
+            )?;
         }
     } else {
         run_in_repo(repo_dir, &["git", "commit", "-m", msg.trim()])?;
@@ -2140,9 +2607,15 @@ fn print_title(title: &str) {
     println!("{}", line.dark_grey());
 }
 
-fn print_success(msg: &str) { println!("{} {}", "✓".green().bold(), msg); }
-fn print_info(msg: &str) { println!("{} {}", "i".cyan().bold(), msg); }
-fn print_warn(msg: &str) { println!("{} {}", "!".yellow().bold(), msg); }
+fn print_success(msg: &str) {
+    println!("{} {}", "✓".green().bold(), msg);
+}
+fn print_info(msg: &str) {
+    println!("{} {}", "i".cyan().bold(), msg);
+}
+fn print_warn(msg: &str) {
+    println!("{} {}", "!".yellow().bold(), msg);
+}
 
 fn hr() -> String {
     let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80);
@@ -2152,12 +2625,18 @@ fn hr() -> String {
 
 fn print_boxed(title: &str, content: &str) {
     let mut lines: Vec<String> = content.lines().map(|s| s.to_string()).collect();
-    if lines.is_empty() { lines.push(String::new()); }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
     let max_line = lines.iter().map(|s| s.len()).max().unwrap_or(0);
     let title_str = format!(" {} ", title);
     let inner_width = max_line.max(title_str.len());
     let top = format!("┌{}┐", "─".repeat(inner_width));
-    let mid_title = format!("│{}{}│", title_str.as_str().bold(), " ".repeat(inner_width.saturating_sub(title_str.len())));
+    let mid_title = format!(
+        "│{}{}│",
+        title_str.as_str().bold(),
+        " ".repeat(inner_width.saturating_sub(title_str.len()))
+    );
     println!("{}", top);
     println!("{}", mid_title);
     println!("│{}│", " ".repeat(inner_width));
@@ -2170,7 +2649,10 @@ fn print_boxed(title: &str, content: &str) {
 
 // Streaming box helpers
 fn stream_box_start(title: &str) -> usize {
-    let width = terminal::size().map(|(w, _)| w as usize).unwrap_or(80).clamp(40, 120);
+    let width = terminal::size()
+        .map(|(w, _)| w as usize)
+        .unwrap_or(80)
+        .clamp(40, 120);
     let inner = width;
     println!("┌{}┐", "─".repeat(inner));
     let title_str = format!(" {} ", title).bold();
@@ -2193,8 +2675,12 @@ fn stream_box_line(inner: usize, line: &str) {
         // Find end index for this chunk without splitting UTF-8 characters
         let mut end = (start + inner).min(bytes.len());
         // Move end back to a char boundary
-        while end > start && (bytes[end - 1] & 0b1100_0000) == 0b1000_0000 { end -= 1; }
-        if end == start { end = (start + inner).min(bytes.len()); }
+        while end > start && (bytes[end - 1] & 0b1100_0000) == 0b1000_0000 {
+            end -= 1;
+        }
+        if end == start {
+            end = (start + inner).min(bytes.len());
+        }
         let chunk = &line[start..end];
         let pad = inner.saturating_sub(chunk.len());
         println!("│{}{}│", chunk, " ".repeat(pad));
@@ -2207,17 +2693,22 @@ fn stream_box_end(inner: usize) {
 }
 
 // Helper to approximate visible length ignoring simple ANSI sequences used by Stylize
-fn strip_ansi_len(s: &str) -> usize { strip_ansi(s).len() }
+fn strip_ansi_len(s: &str) -> usize {
+    strip_ansi(s).len()
+}
 fn strip_ansi(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut bytes = s.as_bytes().iter().cloned();
     let mut in_esc = false;
     while let Some(b) = bytes.next() {
         if in_esc {
-            if b == b'm' { in_esc = false; }
+            if b == b'm' {
+                in_esc = false;
+            }
             continue;
         }
-        if b == 0x1B { // ESC
+        if b == 0x1B {
+            // ESC
             in_esc = true;
             continue;
         }
@@ -2230,7 +2721,9 @@ fn build_changes_summary_box(numstat: &str, shortstat: &str, max_rows: usize) ->
     let mut out = String::new();
     let mut rows = Vec::new();
     for (i, line) in numstat.lines().enumerate() {
-        if i >= max_rows { break; }
+        if i >= max_rows {
+            break;
+        }
         // format: added\tdeleted\tpath
         let parts: Vec<&str> = line.split('\t').collect();
         if parts.len() >= 3 {
@@ -2244,9 +2737,15 @@ fn build_changes_summary_box(numstat: &str, shortstat: &str, max_rows: usize) ->
     out.push('\n');
     if !rows.is_empty() {
         out.push_str("\n");
-        for r in rows { out.push_str(&r); out.push('\n'); }
+        for r in rows {
+            out.push_str(&r);
+            out.push('\n');
+        }
         if numstat.lines().count() > max_rows {
-            out.push_str(&format!("… and {} more files\n", numstat.lines().count() - max_rows));
+            out.push_str(&format!(
+                "… and {} more files\n",
+                numstat.lines().count() - max_rows
+            ));
         }
     }
     out
@@ -2255,12 +2754,17 @@ fn build_changes_summary_box(numstat: &str, shortstat: &str, max_rows: usize) ->
 // -------------------- First-run API key setup --------------------
 
 fn ensure_gemini_api_key_interactive() -> Result<()> {
-    if std::env::var("GEMINI_API_KEY").is_ok() { return Ok(()); }
+    if std::env::var("GEMINI_API_KEY").is_ok() {
+        return Ok(());
+    }
 
-    print_warn("GEMINI_API_KEY not set. AI commit messages require a Google Generative Language API key.");
+    print_warn(
+        "GEMINI_API_KEY not set. AI commit messages require a Google Generative Language API key.",
+    );
     println!("Get a key: {}", "https://ai.google.dev/".underlined());
-    let input = rpassword::prompt_password("Enter GEMINI_API_KEY (hidden, or press Enter to skip): ")
-        .map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
+    let input =
+        rpassword::prompt_password("Enter GEMINI_API_KEY (hidden, or press Enter to skip): ")
+            .map_err(|e| anyhow::anyhow!("failed to read input: {}", e))?;
     let key = input.trim().to_string();
     if key.is_empty() {
         print_warn("No key entered. AI commit requires GEMINI_API_KEY. Exiting.");
@@ -2283,18 +2787,33 @@ fn ensure_gemini_api_key_interactive() -> Result<()> {
         rc_path.push(".zshrc");
     }
 
-    let line = format!("\n# repod: AI commit setup\nexport GEMINI_API_KEY=\"{}\"\n", key);
-    match std::fs::OpenOptions::new().create(true).append(true).open(&rc_path) {
+    let line = format!(
+        "\n# repod: AI commit setup\nexport GEMINI_API_KEY=\"{}\"\n",
+        key
+    );
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&rc_path)
+    {
         Ok(mut f) => {
             use std::io::Write as _;
             if let Err(e) = f.write_all(line.as_bytes()) {
-                print_warn(&format!("Saved key for this session, but failed to update {}: {}", rc_path.display(), e));
+                print_warn(&format!(
+                    "Saved key for this session, but failed to update {}: {}",
+                    rc_path.display(),
+                    e
+                ));
             } else {
                 print_success(&format!("Saved GEMINI_API_KEY to {}", rc_path.display()));
             }
         }
         Err(e) => {
-            print_warn(&format!("Saved key for this session, but failed to open {}: {}", rc_path.display(), e));
+            print_warn(&format!(
+                "Saved key for this session, but failed to open {}: {}",
+                rc_path.display(),
+                e
+            ));
         }
     }
 
@@ -2303,14 +2822,22 @@ fn ensure_gemini_api_key_interactive() -> Result<()> {
 
 // -------------------- Branch helpers --------------------
 
-fn ensure_on_target_branch(repo_dir: &Path, branch_spec: Option<&str>, multi_progress: &MultiProgress) -> Result<String> {
+fn ensure_on_target_branch(
+    repo_dir: &Path,
+    branch_spec: Option<&str>,
+    multi_progress: &MultiProgress,
+) -> Result<String> {
     let current = get_current_branch(repo_dir)?;
     match branch_spec.map(|s| s.trim()) {
         None => Ok(current),
         Some(".") | Some("auto") => {
             // Generate a branch name
             let pb = multi_progress.add(ProgressBar::new_spinner());
-            pb.set_style(ProgressStyle::default_spinner().template("{spinner:.green} {msg} [{elapsed_precise}]").unwrap());
+            pb.set_style(
+                ProgressStyle::default_spinner()
+                    .template("{spinner:.green} {msg} [{elapsed_precise}]")
+                    .unwrap(),
+            );
             pb.enable_steady_tick(std::time::Duration::from_millis(100));
             pb.set_message("Generating branch name...");
             let suggested = generate_branch_name(repo_dir)
@@ -2318,20 +2845,35 @@ fn ensure_on_target_branch(repo_dir: &Path, branch_spec: Option<&str>, multi_pro
                 .unwrap_or_else(|_| default_branch_name());
             pb.finish_with_message(format!("Proposed branch: {}", suggested));
             println!("");
-            let choice = prompt_choice_keypress("› Create branch? [y=accept, e=edit, n=stay]: ", &['y','e','n'])?;
+            let choice = prompt_choice_keypress(
+                "› Create branch? [y=accept, e=edit, n=stay]: ",
+                &['y', 'e', 'n'],
+            )?;
             match choice {
-                'y' => { switch_to_branch(repo_dir, &suggested, true)?; Ok(suggested) }
+                'y' => {
+                    switch_to_branch(repo_dir, &suggested, true)?;
+                    Ok(suggested)
+                }
                 'e' => {
                     let edited = read_line_prompt(&format!("Enter branch name [{}]: ", suggested))?;
-                    let name = if edited.trim().is_empty() { suggested } else { sanitize_branch_name(&edited) };
+                    let name = if edited.trim().is_empty() {
+                        suggested
+                    } else {
+                        sanitize_branch_name(&edited)
+                    };
                     switch_to_branch(repo_dir, &name, true)?;
                     Ok(name)
                 }
-                _ => { print_info("Staying on current branch."); Ok(current) }
+                _ => {
+                    print_info("Staying on current branch.");
+                    Ok(current)
+                }
             }
         }
         Some(target) => {
-            if target == current { return Ok(current); }
+            if target == current {
+                return Ok(current);
+            }
             // If target exists, switch; else create
             let exists = run_in_repo(repo_dir, &["git", "rev-parse", "--verify", target]).is_ok();
             switch_to_branch(repo_dir, target, !exists)?;
@@ -2347,14 +2889,22 @@ fn get_current_branch(repo_dir: &Path) -> Result<String> {
 
 fn switch_to_branch(repo_dir: &Path, name: &str, create: bool) -> Result<()> {
     // Stash if dirty
-    let dirty = !run_in_repo(repo_dir, &["git", "status", "--porcelain"])?.trim().is_empty();
+    let dirty = !run_in_repo(repo_dir, &["git", "status", "--porcelain"])?
+        .trim()
+        .is_empty();
     let mut stashed = false;
     if dirty {
         run_in_repo(repo_dir, &["git", "stash", "-u", "-q"])?;
         stashed = true;
     }
-    let res = if create { run_in_repo(repo_dir, &["git", "checkout", "-b", name]) } else { run_in_repo(repo_dir, &["git", "checkout", name]) };
-    if let Err(e) = res { return Err(e); }
+    let res = if create {
+        run_in_repo(repo_dir, &["git", "checkout", "-b", name])
+    } else {
+        run_in_repo(repo_dir, &["git", "checkout", name])
+    };
+    if let Err(e) = res {
+        return Err(e);
+    }
     if stashed {
         // Try to restore
         let _ = run_in_repo(repo_dir, &["git", "stash", "pop", "-q"]);
@@ -2367,8 +2917,15 @@ fn try_push(repo_dir: &Path, branch: &str) -> Result<()> {
     print_info(&format!("Pushing branch '{}' to origin...", branch));
     let res = run_in_repo(repo_dir, &["git", "push", "-u", "origin", branch]);
     match res {
-        Ok(out) => { println!("{}", out); print_success("Push complete."); Ok(()) }
-        Err(e) => { print_warn(&format!("Push failed: {}", e)); Ok(()) }
+        Ok(out) => {
+            println!("{}", out);
+            print_success("Push complete.");
+            Ok(())
+        }
+        Err(e) => {
+            print_warn(&format!("Push failed: {}", e));
+            Ok(())
+        }
     }
 }
 
@@ -2392,7 +2949,10 @@ fn generate_branch_name(repo_dir: &Path) -> Result<String> {
 fn heuristic_branch_name(repo_dir: &Path) -> Result<String> {
     let diff_base = diff_base_ref(repo_dir);
     let files = run_in_repo(repo_dir, &["git", "diff", "--name-only", diff_base])?;
-    let first = files.lines().find(|l| !l.trim().is_empty()).unwrap_or("changes");
+    let first = files
+        .lines()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("changes");
     let scope = first.split('/').next().unwrap_or("changes");
     let date = chrono::Local::now().format("%Y%m%d");
     let base = format!("feat-{}-{}", scope, date);
@@ -2406,28 +2966,40 @@ fn default_branch_name() -> String {
 
 fn sanitize_branch_name(s: &str) -> String {
     let mut out = s.trim().to_lowercase();
-    out = out.chars().map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '/' { c } else { '-' }).collect();
-    while out.contains("--") { out = out.replace("--", "-"); }
+    out = out
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '-' || c == '/' {
+                c
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    while out.contains("--") {
+        out = out.replace("--", "-");
+    }
     out.trim_matches('-').chars().take(48).collect()
 }
 
 fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
-    // First check the path against excluded patterns
-    let path_str = normalize_full_path(path);
-    if EXCLUDED_PATTERNS.iter().any(|pattern| path_str.contains(pattern)) {
-        return Ok(false);
-    }
-
     // Always allow README files
-    let file_name = path_str.to_lowercase();
-    if file_name.contains("readme.") || file_name == "readme" {
-        return Ok(true);
+    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+        let name_lower = name.to_lowercase();
+        if name_lower.contains("readme.") || name_lower == "readme" {
+            return Ok(true);
+        }
     }
 
     // If repo_types is specified, check if file matches any of the types
     if let Some(repo_types) = repo_types {
-        let ext_lower = path.extension().map(|ext| ext.to_string_lossy().to_lowercase());
-        let file_lower = path.file_name().and_then(|name| name.to_str()).map(|s| s.to_lowercase());
+        let ext_lower = path
+            .extension()
+            .map(|ext| ext.to_string_lossy().to_lowercase());
+        let file_lower = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|s| s.to_lowercase());
 
         return Ok(repo_types.iter().any(|repo_type| {
             let patterns = get_repo_type_extensions(repo_type);
@@ -2458,12 +3030,11 @@ fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
             return Ok(true);
         }
         // Known binary MIME types
-        if
-            mime.starts_with("image/") ||
-            mime.starts_with("audio/") ||
-            mime.starts_with("video/") ||
-            mime.starts_with("application/octet-stream") ||
-            mime.starts_with("application/x-executable")
+        if mime.starts_with("image/")
+            || mime.starts_with("audio/")
+            || mime.starts_with("video/")
+            || mime.starts_with("application/octet-stream")
+            || mime.starts_with("application/x-executable")
         {
             return Ok(false);
         }
@@ -2495,11 +3066,25 @@ fn is_text_file(path: &Path, repo_types: Option<&[RepoType]>) -> Result<bool> {
     Ok(ratio <= TEXT_THRESHOLD)
 }
 
-fn should_process_file(path: &Path, repo_root: &Path, repo_types: Option<&[RepoType]>, only_set: Option<&GlobSet>) -> bool {
+fn should_process_file(
+    path: &Path,
+    repo_root: &Path,
+    repo_types: Option<&[RepoType]>,
+    only_set: Option<&GlobSet>,
+    exclude_set: Option<&GlobSet>,
+) -> bool {
+    let rel = normalize_rel_path(path, repo_root);
     // If only globs exist, require a match on the repo-relative path
     if let Some(set) = only_set {
-        let rel = normalize_rel_path(path, repo_root);
-        if !set.is_match(rel) { return false; }
+        if !set.is_match(&rel) {
+            return false;
+        }
+    }
+
+    if let Some(set) = exclude_set {
+        if set.is_match(&rel) {
+            return false;
+        }
     }
 
     // Then continue with regular filtering by repo_types/textness
@@ -2509,9 +3094,26 @@ fn should_process_file(path: &Path, repo_root: &Path, repo_types: Option<&[RepoT
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
 
+    #[test]
+    fn bin_pattern_does_not_match_ingest_bin_paths() {
+        let custom = Vec::new();
+        let set = build_exclude_globset(EXCLUDED_PATTERNS, &custom).expect("exclude set");
+        assert!(set.is_match("bin/foo.rs"));
+        assert!(!set.is_match("ingest_bin/src/lib.rs"));
+        assert!(!set.is_match("tmp_bind.rs"));
+        assert!(!set.is_match("src/main.rs"));
+    }
+}
 fn extract_repo_name(url: &str) -> String {
-    url.split('/').last().unwrap_or("repo").trim_end_matches(".git").to_string()
+    url.split('/')
+        .last()
+        .unwrap_or("repo")
+        .trim_end_matches(".git")
+        .to_string()
 }
 
 fn is_binary_file(path: &Path) -> Result<bool> {
@@ -2520,19 +3122,20 @@ fn is_binary_file(path: &Path) -> Result<bool> {
     // textual assets are tagged as `application/*` (Package manifests, JSON, etc.).
     if let Some(kind) = infer::get_from_path(path)? {
         let mime = kind.mime_type();
-        let is_text_mime = mime.starts_with("text/") || matches!(
-            mime,
-            "application/json"
-                | "application/ld+json"
-                | "application/xml"
-                | "application/javascript"
-                | "application/x-javascript"
-                | "application/sql"
-                | "application/yaml"
-                | "application/toml"
-                | "application/graphql"
-                | "application/x-sh"
-        );
+        let is_text_mime = mime.starts_with("text/")
+            || matches!(
+                mime,
+                "application/json"
+                    | "application/ld+json"
+                    | "application/xml"
+                    | "application/javascript"
+                    | "application/x-javascript"
+                    | "application/sql"
+                    | "application/yaml"
+                    | "application/toml"
+                    | "application/graphql"
+                    | "application/x-sh"
+            );
         if is_text_mime {
             return Ok(false);
         }
@@ -2566,8 +3169,14 @@ fn print_stats(stats: &ProcessingStats) {
     println!("Total binary files skipped: {}", stats.binary_files_skipped);
     println!("Total tokens: {}", stats.total_tokens);
     println!("Repository clone time: {:.2} seconds", stats.clone_time);
-    println!("Content processing time: {:.2} seconds", stats.processing_time);
-    println!("Total time: {:.2} seconds", stats.clone_time + stats.processing_time);
+    println!(
+        "Content processing time: {:.2} seconds",
+        stats.processing_time
+    );
+    println!(
+        "Total time: {:.2} seconds",
+        stats.clone_time + stats.processing_time
+    );
     println!(
         "Average tokens per file: {:.2}",
         (stats.total_tokens as f64) / (stats.total_files as f64)
